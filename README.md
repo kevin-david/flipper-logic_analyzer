@@ -19,7 +19,8 @@ When arming, you can now look at the trace in PulseView.
 
 Changes:
  - all 8 channels supported Channel 0 is C0, Channel 1 is C1, ... Channel 7 is A7
- - sample rates up to 100 kHz are supported
+ - sample rates up to 100 kHz use absolute CPU-cycle deadlines so loop overhead
+   is included in each interval rather than added to it
  - capture starts immediately when no trigger is configured
  - if a trigger mask is defined, capture starts when a selected signal changes
  - sample capacity is sized at startup from the largest contiguous heap block;

@@ -2,6 +2,8 @@
 
 #include "logic_analyzer_app.h"
 
+#include <furi_hal_cortex.h>
+
 #define COUNT(x)                 ((size_t)(sizeof(x) / sizeof((x)[0])))
 #define SUMP_CLOCK_MHZ           100U
 #define SUMP_CLOCK_HZ            100000000U
@@ -9,7 +11,37 @@
 #define CAPTURE_HEAP_RESERVE     (32U * 1024U)
 #define CAPTURE_ALLOCATION_STEP  (4U * 1024U)
 
+typedef struct {
+    uint32_t deadline;
+    uint32_t whole_cycles;
+    uint32_t fractional_cycles;
+    uint32_t fractional_accumulator;
+} SampleClock;
+
 static void render_callback(Canvas* const canvas, void* cb_ctx);
+
+static void sample_clock_start(SampleClock* clock, uint32_t divider, uint32_t first_sample_cycle) {
+    uint64_t period_numerator =
+        (uint64_t)(divider + 1U) * furi_hal_cortex_instructions_per_microsecond();
+
+    clock->deadline = first_sample_cycle;
+    clock->whole_cycles = period_numerator / SUMP_CLOCK_MHZ;
+    clock->fractional_cycles = period_numerator % SUMP_CLOCK_MHZ;
+    clock->fractional_accumulator = 0;
+}
+
+static void sample_clock_wait_next(SampleClock* clock) {
+    clock->deadline += clock->whole_cycles;
+    clock->fractional_accumulator += clock->fractional_cycles;
+    if(clock->fractional_accumulator >= SUMP_CLOCK_MHZ) {
+        clock->deadline++;
+        clock->fractional_accumulator -= SUMP_CLOCK_MHZ;
+    }
+
+    while((int32_t)(DWT->CYCCNT - clock->deadline) < 0) {
+        __NOP();
+    }
+}
 
 static bool capture_buffer_alloc(AppFSM* app) {
     app->heap_free_before_capture = memmgr_get_free_heap();
@@ -291,8 +323,10 @@ static uint8_t levels_get(AppFSM* app) {
 static int32_t capture_thread_worker(void* context) {
     AppFSM* app = (AppFSM*)context;
     uint8_t prev_levels = 0;
+    SampleClock sample_clock = {0};
 
     while(app->processing) {
+        uint32_t sample_cycle = DWT->CYCCNT;
         app->current_levels = levels_get(app);
 
         if(app->sump->armed) {
@@ -310,8 +344,9 @@ static int32_t capture_thread_worker(void* context) {
                 }
             }
 
-            uint32_t sample_period_us =
-                (app->sump->divider + SUMP_CLOCK_MHZ) / SUMP_CLOCK_MHZ;
+            if(app->capture_pos == 0) {
+                sample_clock_start(&sample_clock, app->sump->divider, sample_cycle);
+            }
 
             app->capture_buffer[app->sump->read_count - 1 - app->capture_pos++] =
                 app->current_levels;
@@ -322,7 +357,7 @@ static int32_t capture_thread_worker(void* context) {
                 AppEvent event = {.type = EventBufferFilled};
                 furi_message_queue_put(app->event_queue, &event, 100);
             } else {
-                furi_delay_us(sample_period_us);
+                sample_clock_wait_next(&sample_clock);
             }
         } else {
             prev_levels = app->current_levels;
