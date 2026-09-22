@@ -50,6 +50,9 @@ typedef struct {
 
     FuriThread* capture_thread;
     uint8_t* capture_buffer;
+    size_t capture_capacity;
+    size_t heap_free_before_capture;
+    size_t heap_max_block_before_capture;
     size_t capture_pos;
     size_t last_capture_count;
     uint8_t current_levels;

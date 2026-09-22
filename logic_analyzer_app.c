@@ -2,11 +2,57 @@
 
 #include "logic_analyzer_app.h"
 
-#define COUNT(x) ((size_t)(sizeof(x) / sizeof((x)[0])))
-#define SUMP_CLOCK_MHZ 100U
-#define SUMP_CLOCK_HZ 100000000U
+#define COUNT(x)                 ((size_t)(sizeof(x) / sizeof((x)[0])))
+#define SUMP_CLOCK_MHZ           100U
+#define SUMP_CLOCK_HZ            100000000U
+#define CAPTURE_MIN_SAMPLE_COUNT 16384U
+#define CAPTURE_HEAP_RESERVE     (32U * 1024U)
+#define CAPTURE_ALLOCATION_STEP  (4U * 1024U)
 
 static void render_callback(Canvas* const canvas, void* cb_ctx);
+
+static bool capture_buffer_alloc(AppFSM* app) {
+    app->heap_free_before_capture = memmgr_get_free_heap();
+    app->heap_max_block_before_capture = memmgr_heap_get_max_free_block();
+
+    size_t target = 0;
+    if(app->heap_max_block_before_capture > CAPTURE_HEAP_RESERVE) {
+        target = app->heap_max_block_before_capture - CAPTURE_HEAP_RESERVE;
+    }
+    if(target > SUMP_MAX_SAMPLE_COUNT) {
+        target = SUMP_MAX_SAMPLE_COUNT;
+    }
+    target &= ~(size_t)0x3U;
+
+    while(target >= CAPTURE_MIN_SAMPLE_COUNT) {
+        app->capture_buffer = malloc(target);
+        if(app->capture_buffer) {
+            app->capture_capacity = target;
+            FURI_LOG_I(
+                TAG,
+                "Capture heap: free=%lu max_block=%lu reserve=%u allocated=%lu",
+                (unsigned long)app->heap_free_before_capture,
+                (unsigned long)app->heap_max_block_before_capture,
+                CAPTURE_HEAP_RESERVE,
+                (unsigned long)app->capture_capacity);
+            return true;
+        }
+
+        if(target < CAPTURE_MIN_SAMPLE_COUNT + CAPTURE_ALLOCATION_STEP) {
+            break;
+        }
+        target = (target - CAPTURE_ALLOCATION_STEP) & ~(size_t)0x3U;
+    }
+
+    FURI_LOG_E(
+        TAG,
+        "Capture allocation failed: free=%lu max_block=%lu reserve=%u minimum=%u",
+        (unsigned long)app->heap_free_before_capture,
+        (unsigned long)app->heap_max_block_before_capture,
+        CAPTURE_HEAP_RESERVE,
+        CAPTURE_MIN_SAMPLE_COUNT);
+    return false;
+}
 
 static const GpioPin* gpios[] = {
     &gpio_ext_pc0,
@@ -93,7 +139,12 @@ static void render_callback(Canvas* const canvas, void* cb_ctx) {
                 (unsigned int)app->last_capture_count,
                 app->sump->flags);
         } else {
-            snprintf(buffer, sizeof(buffer), "READY F:%02X", app->sump->flags);
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "READY M:%luK F:%02X",
+                (unsigned long)(app->capture_capacity / 1024U),
+                app->sump->flags);
         }
         canvas_draw_str_aligned(canvas, 3, 38, AlignLeft, AlignBottom, buffer);
 
@@ -290,7 +341,6 @@ static bool app_init(AppFSM* const app) {
 
     if(!app->mutex) {
         FURI_LOG_E(TAG, "cannot create mutex\r\n");
-        free(app);
         return false;
     }
 
@@ -304,6 +354,19 @@ static bool app_init(AppFSM* const app) {
     app->view_port = view_port_alloc();
     app->event_queue = furi_message_queue_alloc(QUEUE_SIZE, sizeof(AppEvent));
 
+    if(!app->view_port || !app->event_queue) {
+        FURI_LOG_E(TAG, "cannot allocate UI resources\r\n");
+        if(app->view_port) {
+            view_port_free(app->view_port);
+            app->view_port = NULL;
+        }
+        if(app->event_queue) {
+            furi_message_queue_free(app->event_queue);
+            app->event_queue = NULL;
+        }
+        return false;
+    }
+
     view_port_draw_callback_set(app->view_port, render_callback, app);
     view_port_input_callback_set(app->view_port, input_callback, app->event_queue);
     gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
@@ -314,51 +377,100 @@ static bool app_init(AppFSM* const app) {
     uart_config.rx_data = &data_received;
     uart_config.rx_data_ctx = app;
 
-    app->uart = usb_uart_enable(&uart_config);
-    app->sump = sump_alloc();
+    if(!capture_buffer_alloc(app)) {
+        return false;
+    }
+
+    app->sump = sump_alloc(app->capture_capacity);
+    if(!app->sump) {
+        FURI_LOG_E(TAG, "cannot allocate SUMP state\r\n");
+        return false;
+    }
     app->sump->tx_data = tx_sump_tx;
     app->sump->tx_data_ctx = app;
 
-    app->capture_buffer = malloc(MAX_SAMPLE_MEM);
+    app->uart = usb_uart_enable(&uart_config);
+    if(!app->uart) {
+        FURI_LOG_E(TAG, "cannot enable USB UART\r\n");
+        return false;
+    }
 
     for(size_t io = 0; io < COUNT(gpios); io++) {
         furi_hal_gpio_init(gpios[io], GpioModeInput, GpioPullNo, GpioSpeedVeryHigh);
     }
 
     app->capture_thread = furi_thread_alloc_ex("capture_thread", 1024, capture_thread_worker, app);
+    if(!app->capture_thread) {
+        FURI_LOG_E(TAG, "cannot allocate capture thread\r\n");
+        return false;
+    }
     furi_thread_start(app->capture_thread);
 
     return true;
 }
 
 static void app_deinit(AppFSM* const app) {
-    view_port_enabled_set(app->view_port, false);
-    gui_remove_view_port(app->gui, app->view_port);
+    app->processing = false;
 
-    furi_thread_join(app->capture_thread);
-    furi_thread_free(app->capture_thread);
+    if(app->view_port) {
+        view_port_enabled_set(app->view_port, false);
+        if(app->gui) {
+            gui_remove_view_port(app->gui, app->view_port);
+        }
+    }
 
-    view_port_free(app->view_port);
-    furi_message_queue_free(app->event_queue);
-    furi_mutex_free(app->mutex);
+    if(app->capture_thread) {
+        furi_thread_join(app->capture_thread);
+        furi_thread_free(app->capture_thread);
+    }
+
+    if(app->uart) {
+        usb_uart_disable(app->uart);
+    }
+
+    if(app->view_port) {
+        view_port_free(app->view_port);
+    }
+    if(app->event_queue) {
+        furi_message_queue_free(app->event_queue);
+    }
+    if(app->mutex) {
+        furi_mutex_free(app->mutex);
+    }
 
     free(app->capture_buffer);
 
-    sump_free(app->sump);
+    if(app->sump) {
+        sump_free(app->sump);
+    }
 
-    usb_uart_disable(app->uart);
-
-    furi_record_close(RECORD_STORAGE);
-    furi_record_close(RECORD_DIALOGS);
-    furi_record_close(RECORD_GUI);
-    furi_record_close(RECORD_NOTIFICATION);
+    if(app->storage) {
+        furi_record_close(RECORD_STORAGE);
+    }
+    if(app->dialogs) {
+        furi_record_close(RECORD_DIALOGS);
+    }
+    if(app->gui) {
+        furi_record_close(RECORD_GUI);
+    }
+    if(app->notification) {
+        furi_record_close(RECORD_NOTIFICATION);
+    }
 }
 
 int32_t logic_analyzer_app_main(void* p) {
     UNUSED(p);
 
     AppFSM* app = calloc(1, sizeof(AppFSM));
-    app_init(app);
+    if(!app) {
+        return -1;
+    }
+
+    if(!app_init(app)) {
+        app_deinit(app);
+        free(app);
+        return -1;
+    }
 
     dolphin_deed(DolphinDeedPluginGameStart);
     notification_message_block(app->notification, &sequence_display_backlight_enforce_on);

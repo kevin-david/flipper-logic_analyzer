@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 
-#define MAX_SAMPLE_MEM 16384
+#define SUMP_MAX_SAMPLE_COUNT (4UL * ((uint32_t)UINT16_MAX + 1UL))
 
 typedef enum {
     SUMP_CMD_RESET = 0x00,
@@ -28,6 +28,7 @@ typedef struct {
     uint8_t flags;
     uint32_t divider;
     uint32_t read_count;
+    uint32_t max_sample_count;
     uint32_t delay_count;
     uint16_t trig_delay;
     uint16_t trig_config;
@@ -37,7 +38,7 @@ typedef struct {
     void* tx_data_ctx;
 } Sump;
 
-Sump* sump_alloc();
+Sump* sump_alloc(uint32_t max_sample_count);
 
 void sump_free(Sump* sump);
 

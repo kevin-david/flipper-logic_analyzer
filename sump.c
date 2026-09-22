@@ -16,7 +16,7 @@ void sump_handle_get_metadata(Sump* sump) {
     const char* firmware = "v0.99.1";
     const uint8_t probes = 8;
     uint32_t max_sample_rate = 100000;
-    uint32_t max_sample_mem = MAX_SAMPLE_MEM;
+    uint32_t max_sample_mem = sump->max_sample_count;
 
     /* 0x01 	device name (e.g. "Openbench Logic Sniffer v1.0", "Bus Pirate v3b"  */
     buf[pos++] = 0x01;
@@ -115,8 +115,8 @@ size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
 
         case SUMP_CMD_SET_READ_DELAY_COUNT:
             sump->read_count = 4 * ((extra & 0xFFFF) + 1);
-            if(sump->read_count > MAX_SAMPLE_MEM) {
-                sump->read_count = MAX_SAMPLE_MEM;
+            if(sump->read_count > sump->max_sample_count) {
+                sump->read_count = sump->max_sample_count;
             }
             sump->delay_count = 4 * ((extra >> 16) + 1);
             break;
@@ -150,9 +150,19 @@ size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
     return pos;
 }
 
-Sump* sump_alloc() {
+Sump* sump_alloc(uint32_t max_sample_count) {
+    if((max_sample_count < 4U) || (max_sample_count > SUMP_MAX_SAMPLE_COUNT) ||
+       ((max_sample_count & 0x3U) != 0U)) {
+        return NULL;
+    }
+
     Sump* sump = calloc(1, sizeof(Sump));
-    sump->read_count = MAX_SAMPLE_MEM;
+    if(!sump) {
+        return NULL;
+    }
+
+    sump->max_sample_count = max_sample_count;
+    sump->read_count = max_sample_count;
     sump->divider = 999;
 
     return sump;

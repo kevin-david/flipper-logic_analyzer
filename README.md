@@ -22,7 +22,9 @@ Changes:
  - sample rates up to 100 kHz are supported
  - capture starts immediately when no trigger is configured
  - if a trigger mask is defined, capture starts when a selected signal changes
- - sample count is capped to 16384
+ - sample capacity is sized at startup from the largest contiguous heap block;
+   the app reserves 32 KiB for firmware services, requires space for at least
+   16,384 samples, and reports the resulting capacity to PulseView
 
 Discussion thread: https://discord.com/channels/740930220399525928/1074401633615749230
  
