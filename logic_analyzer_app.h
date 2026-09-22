@@ -47,6 +47,7 @@ typedef struct {
     FuriMutex* mutex;
     bool triggered;
     bool processing;
+    bool test_clock_enabled;
 
     FuriThread* capture_thread;
     uint8_t* capture_buffer;

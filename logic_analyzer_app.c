@@ -3,6 +3,7 @@
 #include "logic_analyzer_app.h"
 
 #include <furi_hal_cortex.h>
+#include <furi_hal_pwm.h>
 
 #define COUNT(x)                 ((size_t)(sizeof(x) / sizeof((x)[0])))
 #define SUMP_CLOCK_MHZ           100U
@@ -10,6 +11,7 @@
 #define CAPTURE_MIN_SAMPLE_COUNT 16384U
 #define CAPTURE_HEAP_RESERVE     (32U * 1024U)
 #define CAPTURE_ALLOCATION_STEP  (4U * 1024U)
+#define TEST_CLOCK_FREQUENCY_HZ  10000U
 
 typedef struct {
     uint32_t deadline;
@@ -41,6 +43,20 @@ static void sample_clock_wait_next(SampleClock* clock) {
     while((int32_t)(DWT->CYCCNT - clock->deadline) < 0) {
         __NOP();
     }
+}
+
+static void test_clock_set(AppFSM* app, bool enabled) {
+    if(enabled == app->test_clock_enabled) {
+        return;
+    }
+
+    if(enabled) {
+        furi_hal_pwm_start(FuriHalPwmOutputIdTim1PA7, TEST_CLOCK_FREQUENCY_HZ, 50);
+    } else {
+        furi_hal_pwm_stop(FuriHalPwmOutputIdTim1PA7);
+        furi_hal_gpio_init(&gpio_ext_pa7, GpioModeInput, GpioPullNo, GpioSpeedVeryHigh);
+    }
+    app->test_clock_enabled = enabled;
 }
 
 static bool capture_buffer_alloc(AppFSM* app) {
@@ -106,7 +122,7 @@ static void render_callback(Canvas* const canvas, void* cb_ctx) {
 
     furi_mutex_acquire(app->mutex, FuriWaitForever);
 
-    if(!app->processing) {
+    if(!app->processing || (app->sump && app->sump->armed)) {
         furi_mutex_release(app->mutex);
         return;
     }
@@ -174,9 +190,9 @@ static void render_callback(Canvas* const canvas, void* cb_ctx) {
             snprintf(
                 buffer,
                 sizeof(buffer),
-                "READY M:%luK F:%02X",
+                "READY M:%luK T:%s",
                 (unsigned long)(app->capture_capacity / 1024U),
-                app->sump->flags);
+                app->test_clock_enabled ? "10K" : "OFF");
         }
         canvas_draw_str_aligned(canvas, 3, 38, AlignLeft, AlignBottom, buffer);
 
@@ -244,6 +260,11 @@ static bool message_process(AppFSM* app) {
             break;
 
         case InputKeyRight:
+            if(!app->sump->armed) {
+                furi_mutex_acquire(app->mutex, FuriWaitForever);
+                test_clock_set(app, !app->test_clock_enabled);
+                furi_mutex_release(app->mutex);
+            }
             break;
 
         case InputKeyLeft:
@@ -288,6 +309,8 @@ static bool message_process(AppFSM* app) {
 size_t data_received(void* ctx, uint8_t* data, size_t length) {
     AppFSM* app = (AppFSM*)ctx;
 
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+
     snprintf(
         app->state_string,
         sizeof(app->state_string),
@@ -296,7 +319,10 @@ size_t data_received(void* ctx, uint8_t* data, size_t length) {
         data[0],
         length);
 
-    return sump_handle(app->sump, data, length);
+    size_t handled = sump_handle(app->sump, data, length);
+    furi_mutex_release(app->mutex);
+
+    return handled;
 }
 
 void tx_sump_tx(void* ctx, uint8_t* data, size_t length) {
@@ -439,6 +465,7 @@ static bool app_init(AppFSM* const app) {
         FURI_LOG_E(TAG, "cannot allocate capture thread\r\n");
         return false;
     }
+    furi_thread_set_priority(app->capture_thread, FuriThreadPriorityHighest);
     furi_thread_start(app->capture_thread);
 
     return true;
@@ -457,6 +484,10 @@ static void app_deinit(AppFSM* const app) {
     if(app->capture_thread) {
         furi_thread_join(app->capture_thread);
         furi_thread_free(app->capture_thread);
+    }
+
+    if(app->test_clock_enabled) {
+        test_clock_set(app, false);
     }
 
     if(app->uart) {
@@ -513,7 +544,9 @@ int32_t logic_analyzer_app_main(void* p) {
     while(app->processing) {
         app->processing = message_process(app);
 
-        view_port_update(app->view_port);
+        if(!app->sump->armed) {
+            view_port_update(app->view_port);
+        }
     }
 
     notification_message_block(app->notification, &sequence_display_backlight_enforce_auto);
