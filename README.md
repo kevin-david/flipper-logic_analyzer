@@ -46,8 +46,11 @@ To check sampling timing against a hardware-generated reference clock:
 
 Changes:
  - all 8 channels supported Channel 0 is C0, Channel 1 is C1, ... Channel 7 is A7
- - sample rates up to 100 kHz use absolute CPU-cycle deadlines so loop overhead
-   is included in each interval rather than added to it
+ - the 200 kHz maximum matches the default used by the libsigrok OLS driver;
+   100 kHz is the highest rate verified on hardware in this branch
+ - sampling uses absolute CPU-cycle deadlines; if firmware work delays a sample,
+   the app waits for a new period instead of adding false catch-up samples;
+   `O:n` reports the number of clock restarts after the capture
  - capture starts immediately when no trigger is configured
  - masked trigger values and up to four sequential SUMP trigger stages are supported
  - the requested capture ratio retains pre-trigger samples in a circular buffer;
@@ -57,6 +60,9 @@ Changes:
    16,384 samples, and reports the resulting capacity to PulseView
  - the second USB serial port carries analyzer data while the first remains
    available for the Flipper CLI
+
+Run the portable capture and SUMP tests with `make -C tests test`. The same
+command runs in CI.
 
 Discussion thread: https://discord.com/channels/740930220399525928/1074401633615749230
  
