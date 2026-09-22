@@ -199,8 +199,7 @@ static void render_callback(Canvas* const canvas, void* cb_ctx) {
             snprintf(
                 buffer,
                 sizeof(buffer),
-                "S:%u O:%lu T:%s P:%s",
-                (unsigned int)app->last_capture_count,
+                "O:%lu T:%s P:%s",
                 (unsigned long)app->last_capture_overruns,
                 app->test_clock_enabled ? "10K" : "OFF",
                 input_pull_label(app->input_pull));
@@ -495,6 +494,29 @@ static void capture_priority_set(bool* elevated, bool requested) {
     *elevated = requested;
 }
 
+static uint32_t capture_run_immediate(AppFSM* app, CaptureState* capture, CaptureClock* clock) {
+    uint32_t overrun_count = 0;
+    capture_state_trigger(capture);
+
+    for(size_t position = 0; position < capture->sample_count; position++) {
+        capture->buffer[position] = levels_get(app);
+        if(position + 1U == capture->sample_count) break;
+
+        uint32_t deadline = capture_clock_advance(clock);
+        uint32_t current_cycle = DWT->CYCCNT;
+        if(capture_clock_restart_after_overrun(clock, current_cycle)) {
+            overrun_count++;
+            deadline = clock->deadline;
+        }
+        while((int32_t)(DWT->CYCCNT - deadline) < 0) {
+            __NOP();
+        }
+    }
+
+    capture->posttrigger_filled = capture->sample_count;
+    return overrun_count;
+}
+
 static int32_t capture_thread_worker(void* context) {
     AppFSM* app = (AppFSM*)context;
     CaptureState capture = {0};
@@ -508,11 +530,14 @@ static int32_t capture_thread_worker(void* context) {
 
     while(true) {
         CaptureCommand command = {.type = CaptureCommandNone};
-        FuriStatus status =
-            furi_message_queue_get(app->capture_commands, &command, active ? 0 : FuriWaitForever);
-        if(status != FuriStatusOk && status != FuriStatusErrorTimeout &&
-           status != FuriStatusErrorResource) {
-            furi_crash("Capture command queue failed");
+        if(!active || !elevated) {
+            // Command producers cannot run while this thread has highest priority.
+            FuriStatus status = furi_message_queue_get(
+                app->capture_commands, &command, active ? 0 : FuriWaitForever);
+            if(status != FuriStatusOk && status != FuriStatusErrorTimeout &&
+               status != FuriStatusErrorResource) {
+                furi_crash("Capture command queue failed");
+            }
         }
 
         if(command.type == CaptureCommandStop) {
@@ -553,8 +578,15 @@ static int32_t capture_thread_worker(void* context) {
             active_generation = command.generation;
             overrun_count = 0;
             trigger_stage = 0;
-            capture_priority_set(
-                &elevated, !config.has_trigger && capture_is_short_burst(&config));
+            bool bounded_immediate = !config.has_trigger && capture_is_short_burst(&config);
+            capture_priority_set(&elevated, bounded_immediate);
+            if(bounded_immediate) {
+                overrun_count = capture_run_immediate(app, &capture, &clock);
+                capture_priority_set(&elevated, false);
+                capture_complete(app, &capture, active_generation, overrun_count);
+                active = false;
+                continue;
+            }
         }
 
         if(!active) {

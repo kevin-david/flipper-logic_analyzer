@@ -39,15 +39,15 @@ To check sampling timing against a hardware-generated reference clock:
 1. Connect a jumper between PA7 (physical pin 2) and PC0 (physical pin 16).
 2. Launch the logic analyzer and press **Right**. The display changes from
    `T:OFF` to `T:10K` and PA7 outputs a timer-driven 10 kHz square wave.
-3. Capture at 100 kHz in PulseView. Channel 0 should alternate in runs of five
-   low samples and five high samples.
+3. Capture at 100 or 200 kHz in PulseView. Channel 0 should alternate in runs
+   of five samples at 100 kHz or ten samples at 200 kHz.
 4. Press **Right** again to stop the test clock before removing the jumper. The
    app also stops the clock and restores PA7 as an input when exiting.
 
 Changes:
  - all 8 channels supported Channel 0 is C0, Channel 1 is C1, ... Channel 7 is A7
- - the 200 kHz maximum matches the default used by the libsigrok OLS driver;
-   100 kHz is the highest rate verified on hardware in this branch
+ - the 200 kHz maximum matches the default used by the libsigrok OLS driver
+   and is verified by reading back the timer-driven PA7 output
  - sampling uses absolute CPU-cycle deadlines; if firmware work delays a sample,
    the app waits for a new period instead of adding false catch-up samples;
    `O:n` reports the number of clock restarts after the capture
