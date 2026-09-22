@@ -51,9 +51,24 @@ typedef struct {
     size_t posttrigger_count;
     uint32_t divider;
     uint8_t trigger_stage_count;
+    bool has_trigger;
     uint8_t trigger_mask[SUMP_TRIGGER_STAGE_COUNT];
     uint8_t trigger_values[SUMP_TRIGGER_STAGE_COUNT];
 } CaptureConfig;
+
+typedef enum {
+    CaptureCommandNone,
+    CaptureCommandStop,
+    CaptureCommandArm,
+    CaptureCommandFinish,
+    CaptureCommandAbort,
+} CaptureCommandType;
+
+typedef struct {
+    CaptureCommandType type;
+    uint32_t generation;
+    CaptureConfig config;
+} CaptureCommand;
 
 typedef enum {
     InputPullFloat,
@@ -73,6 +88,7 @@ typedef struct {
 
     FuriMutex* mutex;
     FuriSemaphore* arm_display_sem;
+    FuriMessageQueue* capture_commands;
     bool processing;
     bool capture_active;
     bool test_clock_enabled;
@@ -83,9 +99,10 @@ typedef struct {
     size_t capture_capacity;
     size_t heap_free_before_capture;
     size_t heap_max_block_before_capture;
+    uint32_t capture_generation;
     CaptureConfig pending_capture;
-    CaptureConfig active_capture;
     size_t last_capture_count;
+    uint32_t last_capture_overruns;
     uint8_t current_levels;
 
 } AppFSM;

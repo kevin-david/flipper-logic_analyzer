@@ -9,6 +9,7 @@
 #define USB_CDC_PKT_LEN          CDC_DATA_SZ
 #define USB_MODE_SWITCH_DELAY_MS 500
 #define USB_ANALYZER_CDC_CHANNEL 1U
+#define USB_TX_TIMEOUT_MS        250U
 
 #define USB_CDC_BIT_DTR (1 << 0)
 #define USB_CDC_BIT_RTS (1 << 1)
@@ -52,7 +53,7 @@ static void usb_uart_vcp_deinit(void) {
     furi_hal_cdc_set_callbacks(USB_ANALYZER_CDC_CHANNEL, NULL, NULL);
 }
 
-void usb_uart_tx_data(UsbUart* usb_uart, uint8_t* data, size_t length) {
+bool usb_uart_tx_data(UsbUart* usb_uart, uint8_t* data, size_t length) {
     uint32_t pos = 0;
     while(pos < length) {
         size_t pkt_size = length - pos;
@@ -61,14 +62,17 @@ void usb_uart_tx_data(UsbUart* usb_uart, uint8_t* data, size_t length) {
             pkt_size = USB_CDC_PKT_LEN;
         }
 
-        if(furi_semaphore_acquire(usb_uart->tx_sem, 100) == FuriStatusOk) {
-            furi_check(furi_mutex_acquire(usb_uart->usb_mutex, FuriWaitForever) == FuriStatusOk);
-            furi_hal_cdc_send(USB_ANALYZER_CDC_CHANNEL, &data[pos], pkt_size);
-            usb_uart->st.tx_cnt += pkt_size;
-            furi_check(furi_mutex_release(usb_uart->usb_mutex) == FuriStatusOk);
-            pos += pkt_size;
+        if(furi_semaphore_acquire(usb_uart->tx_sem, USB_TX_TIMEOUT_MS) != FuriStatusOk) {
+            return false;
         }
+
+        furi_check(furi_mutex_acquire(usb_uart->usb_mutex, FuriWaitForever) == FuriStatusOk);
+        furi_hal_cdc_send(USB_ANALYZER_CDC_CHANNEL, &data[pos], pkt_size);
+        usb_uart->st.tx_cnt += pkt_size;
+        furi_check(furi_mutex_release(usb_uart->usb_mutex) == FuriStatusOk);
+        pos += pkt_size;
     }
+    return true;
 }
 
 static int32_t usb_uart_worker(void* context) {

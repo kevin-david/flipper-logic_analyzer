@@ -59,20 +59,30 @@ uint32_t capture_clock_advance(CaptureClock* clock) {
     return clock->deadline;
 }
 
+bool capture_clock_restart_after_overrun(CaptureClock* clock, uint32_t current_cycle) {
+    if((int32_t)(current_cycle - clock->deadline) < 0) {
+        return false;
+    }
+
+    // SUMP cannot show a time gap. Wait for a new period instead of adding false samples.
+    clock->deadline = current_cycle;
+    clock->fractional_accumulator = 0;
+    capture_clock_advance(clock);
+    return true;
+}
+
 size_t capture_posttrigger_count(
     size_t sample_count,
     size_t requested_posttrigger_count,
-    uint8_t trigger_stage_count,
     bool has_trigger) {
     if(!has_trigger) {
         return sample_count;
     }
 
-    size_t stage_adjusted_count = requested_posttrigger_count + trigger_stage_count;
-    if(stage_adjusted_count < requested_posttrigger_count || stage_adjusted_count > sample_count) {
+    if(requested_posttrigger_count > sample_count) {
         return sample_count;
     }
-    return stage_adjusted_count;
+    return requested_posttrigger_count;
 }
 
 bool capture_state_init(

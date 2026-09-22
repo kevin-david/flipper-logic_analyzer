@@ -1,24 +1,29 @@
 
 #include <furi.h>
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "sump.h"
 
-void sump_handle_query(Sump* sump) {
-    sump->tx_data(sump->tx_data_ctx, (uint8_t*)"1ALS", 4);
+size_t sump_write_id(uint8_t* buffer, size_t buffer_size) {
+    if(!buffer || buffer_size < 4U) return 0;
+    memcpy(buffer, "1ALS", 4U);
+    return 4U;
 }
 
-void sump_handle_get_metadata(Sump* sump) {
-    uint8_t buf[128];
+size_t sump_write_metadata(const Sump* sump, uint8_t* buffer, size_t buffer_size) {
+    if(!sump || !buffer || buffer_size < SUMP_REPLY_BUFFER_SIZE) return 0;
+
+    uint8_t* buf = buffer;
     size_t pos = 0;
 
     const char* name = "Flipper LogicAnalyzer v1.0 (originally by g3gg0.de)";
     const char* fpga = "(none)";
     const char* firmware = "v0.99.1";
     const uint8_t probes = 8;
-    uint32_t max_sample_rate = 100000;
+    uint32_t max_sample_rate = SUMP_MAX_SAMPLE_RATE_HZ;
     uint32_t max_sample_mem = sump->max_sample_count;
 
     /* 0x01 	device name (e.g. "Openbench Logic Sniffer v1.0", "Bus Pirate
@@ -62,7 +67,7 @@ void sump_handle_get_metadata(Sump* sump) {
     /* 0x00 	not used, key means end of metadata*/
     buf[pos++] = 0x00;
 
-    sump->tx_data(sump->tx_data_ctx, buf, pos);
+    return pos;
 }
 
 static uint32_t get_word(const uint8_t* data) {
@@ -95,6 +100,7 @@ static bool sump_handle_trigger_command(Sump* sump, uint8_t command, uint32_t ex
 SumpHandleResult sump_handle(Sump* sump, const uint8_t* data, size_t length) {
     size_t pos = 0;
     SumpCaptureCommand capture_command = SumpCaptureCommandNone;
+    uint8_t replies = SumpReplyNone;
 
     while(pos < length) {
         uint8_t command = data[pos];
@@ -105,6 +111,7 @@ SumpHandleResult sump_handle(Sump* sump, const uint8_t* data, size_t length) {
                 return (SumpHandleResult){
                     .consumed = pos,
                     .capture_command = capture_command,
+                    .replies = replies,
                 };
             }
             pos++;
@@ -120,7 +127,6 @@ SumpHandleResult sump_handle(Sump* sump, const uint8_t* data, size_t length) {
 
         switch(command) {
         case SUMP_CMD_RESET:
-            sump->armed = false;
             memset(sump->trig_mask, 0, sizeof(sump->trig_mask));
             memset(sump->trig_values, 0, sizeof(sump->trig_values));
             memset(sump->trig_config, 0, sizeof(sump->trig_config));
@@ -128,23 +134,21 @@ SumpHandleResult sump_handle(Sump* sump, const uint8_t* data, size_t length) {
             break;
 
         case SUMP_CMD_ARM:
-            sump->armed = true;
             capture_command = SumpCaptureCommandArm;
             break;
 
         case SUMP_CMD_QUERY_ID:
-            sump_handle_query(sump);
+            replies |= SumpReplyId;
             break;
 
         case SUMP_CMD_SELF_TEST:
             break;
 
         case SUMP_CMD_GET_METADATA:
-            sump_handle_get_metadata(sump);
+            replies |= SumpReplyMetadata;
             break;
 
         case SUMP_CMD_FINISH_NOW:
-            sump->armed = false;
             capture_command = SumpCaptureCommandFinish;
             break;
 
@@ -181,6 +185,7 @@ SumpHandleResult sump_handle(Sump* sump, const uint8_t* data, size_t length) {
     return (SumpHandleResult){
         .consumed = pos,
         .capture_command = capture_command,
+        .replies = replies,
     };
 }
 

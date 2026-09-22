@@ -31,10 +31,11 @@ void capture_clock_start(
 
 uint32_t capture_clock_advance(CaptureClock* clock);
 
+bool capture_clock_restart_after_overrun(CaptureClock* clock, uint32_t current_cycle);
+
 size_t capture_posttrigger_count(
     size_t sample_count,
     size_t requested_posttrigger_count,
-    uint8_t trigger_stage_count,
     bool has_trigger);
 
 bool capture_state_init(

@@ -12,10 +12,20 @@ static void test_clock_uses_absolute_fractional_deadlines(void) {
     assert(capture_clock_advance(&clock) == 2021);
 }
 
+static void test_clock_waits_after_an_overrun(void) {
+    CaptureClock clock;
+    capture_clock_start(&clock, 999, 64, 100);
+
+    assert(capture_clock_advance(&clock) == 740);
+    assert(capture_clock_restart_after_overrun(&clock, 800));
+    assert(clock.deadline == 1440);
+    assert(!capture_clock_restart_after_overrun(&clock, 1000));
+}
+
 static void test_trigger_stages_align_the_host_marker(void) {
-    assert(capture_posttrigger_count(100, 40, 3, true) == 43);
-    assert(capture_posttrigger_count(100, 100, 1, true) == 100);
-    assert(capture_posttrigger_count(100, 40, 4, false) == 100);
+    assert(capture_posttrigger_count(100, 40, true) == 40);
+    assert(capture_posttrigger_count(100, 101, true) == 100);
+    assert(capture_posttrigger_count(100, 40, false) == 100);
 }
 
 static void test_immediate_capture_is_reversed_for_sump(void) {
@@ -90,6 +100,7 @@ static void test_manual_finish_pads_unsampled_tail(void) {
 
 int main(void) {
     test_clock_uses_absolute_fractional_deadlines();
+    test_clock_waits_after_an_overrun();
     test_trigger_stages_align_the_host_marker();
     test_immediate_capture_is_reversed_for_sump();
     test_pretrigger_ring_keeps_latest_samples();
