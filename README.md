@@ -13,17 +13,16 @@ I'm in the process of bringing this in line with the latest flipper firmwares. R
        pulseview -d ols:conn=/dev/ttyACM1
 
 #### continued instructions from the original developer:
-Then start PulseView and add a new "Openbench Logic Sniffer (ols)" and select the second flipper serial port.
+Then start PulseView and add a new "Openbench Logic Sniffer (ols)" and select the Flipper serial port.
 
 When arming, you can now look at the trace in PulseView.
 
 Changes:
  - all 8 channels supported Channel 0 is C0, Channel 1 is C1, ... Channel 7 is A7
- - fixed sampling rate not supported (yet?)
- - if a trigger level is defined, no matter which one, the signals are captured as soon this signal changes
- - maximum capture rate unclear. didn't make any tests. guess in the 100kHz range
- - sample count capped to 16384 for now. didn't check what is possible using malloc()
- - only ONE SHOT currently supported. unknown reason. you have to close and reopen the capture window in PulseView (probably bug in PulseView?)
+ - sample rates up to 100 kHz are supported
+ - capture starts immediately when no trigger is configured
+ - if a trigger mask is defined, capture starts when a selected signal changes
+ - sample count is capped to 16384
 
 Discussion thread: https://discord.com/channels/740930220399525928/1074401633615749230
  

@@ -7,10 +7,10 @@
 #include "usb_cdc.h"
 #include "cli/cli_vcp.h"
 #include <toolbox/api_lock.h>
-#include "cli/cli.h"
 
-#define USB_CDC_PKT_LEN CDC_DATA_SZ
-#define USB_UART_RX_BUF_SIZE (USB_CDC_PKT_LEN * 5)
+#define USB_CDC_PKT_LEN          CDC_DATA_SZ
+#define USB_UART_RX_BUF_SIZE     (USB_CDC_PKT_LEN * 5)
+#define USB_MODE_SWITCH_DELAY_MS 500
 
 #define USB_CDC_BIT_DTR (1 << 0)
 #define USB_CDC_BIT_RTS (1 << 1)
@@ -33,14 +33,15 @@ struct UsbUart {
     FuriSemaphore* tx_sem;
     UsbUartState st;
     FuriApiLock cfg_lock;
+    CliVcp* cli_vcp;
 
     uint8_t rx_buf[USB_CDC_PKT_LEN];
 };
 
 static void vcp_on_cdc_tx_complete(void* context);
 static void vcp_on_cdc_rx(void* context);
-static void vcp_state_callback(void* context, uint8_t state);
-static void vcp_on_cdc_control_line(void* context, uint8_t state);
+static void vcp_state_callback(void* context, CdcState state);
+static void vcp_on_cdc_control_line(void* context, CdcCtrlLine state);
 static void vcp_on_line_config(void* context, struct usb_cdc_line_coding* config);
 
 static const CdcCallbacks cdc_cb = {
@@ -53,26 +54,21 @@ static const CdcCallbacks cdc_cb = {
 static void usb_uart_vcp_init(UsbUart* usb_uart, uint8_t vcp_ch) {
     furi_hal_usb_unlock();
 
-    Cli* cli = furi_record_open(RECORD_CLI);
-    cli_session_close(cli);
+    cli_vcp_disable(usb_uart->cli_vcp);
 
     if(vcp_ch == 0) {
         furi_check(furi_hal_usb_set_config(&usb_cdc_single, NULL) == true);
     } else {
         furi_check(furi_hal_usb_set_config(&usb_cdc_dual, NULL) == true);
-        cli_session_open(cli, &cli_vcp);
+        cli_vcp_enable(usb_uart->cli_vcp);
     }
-    furi_record_close(RECORD_CLI);
     furi_hal_cdc_set_callbacks(vcp_ch, (CdcCallbacks*)&cdc_cb, usb_uart);
 }
 
 static void usb_uart_vcp_deinit(UsbUart* usb_uart, uint8_t vcp_ch) {
-    UNUSED(usb_uart);
     furi_hal_cdc_set_callbacks(vcp_ch, NULL, NULL);
     if(vcp_ch != 0) {
-        Cli* cli = furi_record_open(RECORD_CLI);
-        cli_session_close(cli);
-        furi_record_close(RECORD_CLI);
+        cli_vcp_disable(usb_uart->cli_vcp);
     }
 }
 
@@ -99,10 +95,13 @@ static int32_t usb_uart_worker(void* context) {
     UsbUart* usb_uart = (UsbUart*)context;
 
     memcpy(&usb_uart->cfg, &usb_uart->cfg_new, sizeof(UsbUartConfig));
+    usb_uart->cli_vcp = furi_record_open(RECORD_CLI_VCP);
 
     usb_uart->tx_sem = furi_semaphore_alloc(1, 1);
     usb_uart->usb_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
 
+    // Let the loader acknowledge app startup before changing the USB descriptor.
+    furi_delay_ms(USB_MODE_SWITCH_DELAY_MS);
     usb_uart_vcp_init(usb_uart, usb_uart->cfg.vcp_ch);
 
     uint8_t data[2 * USB_CDC_PKT_LEN];
@@ -151,9 +150,8 @@ static int32_t usb_uart_worker(void* context) {
 
     furi_hal_usb_unlock();
     furi_check(furi_hal_usb_set_config(&usb_cdc_single, NULL) == true);
-    Cli* cli = furi_record_open(RECORD_CLI);
-    cli_session_open(cli, &cli_vcp);
-    furi_record_close(RECORD_CLI);
+    cli_vcp_enable(usb_uart->cli_vcp);
+    furi_record_close(RECORD_CLI_VCP);
 
     return 0;
 }
@@ -169,12 +167,12 @@ static void vcp_on_cdc_rx(void* context) {
     furi_thread_flags_set(furi_thread_get_id(usb_uart->thread), WorkerEvtCdcRx);
 }
 
-static void vcp_state_callback(void* context, uint8_t state) {
+static void vcp_state_callback(void* context, CdcState state) {
     UNUSED(context);
     UNUSED(state);
 }
 
-static void vcp_on_cdc_control_line(void* context, uint8_t state) {
+static void vcp_on_cdc_control_line(void* context, CdcCtrlLine state) {
     UNUSED(context);
     UNUSED(state);
 }
@@ -185,7 +183,7 @@ static void vcp_on_line_config(void* context, struct usb_cdc_line_coding* config
 }
 
 UsbUart* usb_uart_enable(UsbUartConfig* cfg) {
-    UsbUart* usb_uart = malloc(sizeof(UsbUart));
+    UsbUart* usb_uart = calloc(1, sizeof(UsbUart));
     memcpy(&(usb_uart->cfg_new), cfg, sizeof(UsbUartConfig));
 
     usb_uart->thread = furi_thread_alloc_ex("UsbUartWorker", 1024, usb_uart_worker, usb_uart);
