@@ -26,6 +26,47 @@ typedef enum {
 static void render_callback(Canvas* const canvas, void* cb_ctx);
 static uint8_t levels_get(AppFSM* app);
 
+static GpioPull input_pull_gpio(InputPullMode pull) {
+    switch(pull) {
+    case InputPullDown:
+        return GpioPullDown;
+    case InputPullUp:
+        return GpioPullUp;
+    case InputPullFloat:
+    default:
+        return GpioPullNo;
+    }
+}
+
+static const char* input_pull_label(InputPullMode pull) {
+    switch(pull) {
+    case InputPullDown:
+        return "DN";
+    case InputPullUp:
+        return "UP";
+    case InputPullFloat:
+    default:
+        return "FLT";
+    }
+}
+
+static InputPullMode input_pull_next(InputPullMode pull) {
+    switch(pull) {
+    case InputPullFloat:
+        return InputPullDown;
+    case InputPullDown:
+        return InputPullUp;
+    case InputPullUp:
+    default:
+        return InputPullFloat;
+    }
+}
+
+static void input_pin_init(const AppFSM* app, const GpioPin* pin) {
+    furi_hal_gpio_init(
+        pin, GpioModeInput, input_pull_gpio(app->input_pull), GpioSpeedVeryHigh);
+}
+
 static void test_clock_set(AppFSM* app, bool enabled) {
     if(enabled == app->test_clock_enabled) return;
 
@@ -33,7 +74,7 @@ static void test_clock_set(AppFSM* app, bool enabled) {
         furi_hal_pwm_start(FuriHalPwmOutputIdTim1PA7, TEST_CLOCK_FREQUENCY_HZ, 50);
     } else {
         furi_hal_pwm_stop(FuriHalPwmOutputIdTim1PA7);
-        furi_hal_gpio_init(&gpio_ext_pa7, GpioModeInput, GpioPullNo, GpioSpeedVeryHigh);
+        input_pin_init(app, &gpio_ext_pa7);
     }
     app->test_clock_enabled = enabled;
 }
@@ -80,6 +121,13 @@ static const GpioPin* gpios[] = {
     &gpio_ext_pa4,
     &gpio_ext_pa6,
     &gpio_ext_pa7};
+
+static void input_pull_apply(const AppFSM* app) {
+    for(size_t io = 0; io < COUNT(gpios); io++) {
+        if(app->test_clock_enabled && gpios[io] == &gpio_ext_pa7) continue;
+        input_pin_init(app, gpios[io]);
+    }
+}
 
 static void render_callback(Canvas* const canvas, void* cb_ctx) {
     AppFSM* app = cb_ctx;
@@ -160,16 +208,18 @@ static void render_callback(Canvas* const canvas, void* cb_ctx) {
             snprintf(
                 buffer,
                 sizeof(buffer),
-                "SENT %u F:%02X",
+                "S:%u T:%s P:%s",
                 (unsigned int)app->last_capture_count,
-                app->sump->flags);
+                app->test_clock_enabled ? "10K" : "OFF",
+                input_pull_label(app->input_pull));
         } else {
             snprintf(
                 buffer,
                 sizeof(buffer),
-                "READY M:%luK T:%s",
+                "M:%luK T:%s P:%s",
                 (unsigned long)(app->capture_capacity / 1024U),
-                app->test_clock_enabled ? "10K" : "OFF");
+                app->test_clock_enabled ? "10K" : "OFF",
+                input_pull_label(app->input_pull));
         }
         canvas_draw_str_aligned(canvas, 3, 38, AlignLeft, AlignBottom, buffer);
 
@@ -238,11 +288,17 @@ static bool message_process(AppFSM* app) {
 
         case InputKeyRight:
             furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
-            if(!app->capture_active) test_clock_set(app, !app->test_clock_enabled);
+            if(!app->sump->armed) test_clock_set(app, !app->test_clock_enabled);
             furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
             break;
 
         case InputKeyLeft:
+            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+            if(!app->sump->armed) {
+                app->input_pull = input_pull_next(app->input_pull);
+                input_pull_apply(app);
+            }
+            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
             break;
 
         case InputKeyOk:
@@ -531,9 +587,7 @@ static bool app_init(AppFSM* const app) {
     app->sump->tx_data = tx_sump_tx;
     app->sump->tx_data_ctx = app;
 
-    for(size_t io = 0; io < COUNT(gpios); io++) {
-        furi_hal_gpio_init(gpios[io], GpioModeInput, GpioPullNo, GpioSpeedVeryHigh);
-    }
+    input_pull_apply(app);
 
     app->capture_thread = furi_thread_alloc_ex("capture_thread", 1024, capture_thread_worker, app);
     if(!app->capture_thread) {

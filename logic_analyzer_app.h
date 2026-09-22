@@ -55,6 +55,12 @@ typedef struct {
     uint8_t trigger_values[SUMP_TRIGGER_STAGE_COUNT];
 } CaptureConfig;
 
+typedef enum {
+    InputPullFloat,
+    InputPullDown,
+    InputPullUp,
+} InputPullMode;
+
 typedef struct {
     FuriMessageQueue* event_queue;
     NotificationApp* notification;
@@ -70,6 +76,7 @@ typedef struct {
     bool processing;
     bool capture_active;
     bool test_clock_enabled;
+    InputPullMode input_pull;
 
     FuriThread* capture_thread;
     uint8_t* capture_buffer;

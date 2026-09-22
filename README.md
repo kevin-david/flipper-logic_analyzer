@@ -20,6 +20,18 @@ the app rather than assuming `/dev/ttyACM1`.
 
 When arming, you can now look at the trace in PulseView.
 
+## Input pull controls
+
+While the analyzer is idle, press **Left** to cycle the GPIO input bias through
+`P:FLT` (floating, the default), `P:DN` (internal pull-down), and `P:UP`
+(internal pull-up). Pull-down gives disconnected inputs a stable low level for
+manual 3.3 V tests without external resistors. Use floating mode when the
+signals are already driven by the circuit under test.
+
+The selected pull applies to all eight analyzer inputs. If the `T:10K` test
+clock is active, A7 remains a timer output; disabling the clock restores A7 as
+an input with the selected pull.
+
 ## Timing loopback
 
 To check sampling timing against a hardware-generated reference clock:
