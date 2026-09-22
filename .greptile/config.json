@@ -1,6 +1,5 @@
 {
-  "autoReview": ["open"],
-  "labels": [],
+  "autoReview": [],
   "strictness": 2,
   "commentTypes": ["logic", "syntax"],
   "instructions": "This is a Flipper Zero logic analyzer written in C. Prioritize observable bugs in sampling timing, trigger and pretrigger ordering, SUMP command/reply compatibility with PulseView, GPIO pin ownership, and bounded memory use. Check changed behavior against the host tests and the hardware constraints described in README.md. Avoid style-only suggestions."
