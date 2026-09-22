@@ -3,6 +3,8 @@
 #include "logic_analyzer_app.h"
 
 #define COUNT(x) ((size_t)(sizeof(x) / sizeof((x)[0])))
+#define SUMP_CLOCK_MHZ 100U
+#define SUMP_CLOCK_HZ 100000000U
 
 static void render_callback(Canvas* const canvas, void* cb_ctx);
 
@@ -20,11 +22,11 @@ static const GpioPin* gpios[] = {
 
 static void render_callback(Canvas* const canvas, void* cb_ctx) {
     AppFSM* app = cb_ctx;
-    furi_mutex_acquire(app->mutex, FuriWaitForever);
-
     if(app == NULL) {
         return;
     }
+
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
 
     if(!app->processing) {
         furi_mutex_release(app->mutex);
@@ -32,51 +34,95 @@ static void render_callback(Canvas* const canvas, void* cb_ctx) {
     }
 
     char buffer[64];
-    int y = 10;
-
     canvas_draw_frame(canvas, 0, 0, 128, 64);
-    canvas_draw_str_aligned(canvas, 5, y, AlignLeft, AlignBottom, "State");
-    y += 10;
+    canvas_set_font(canvas, FontKeyboard);
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "A7:%u A6:%u A4:%u B3:%u",
+        (app->current_levels >> 7) & 1,
+        (app->current_levels >> 6) & 1,
+        (app->current_levels >> 5) & 1,
+        (app->current_levels >> 4) & 1);
+    canvas_draw_str_aligned(canvas, 3, 9, AlignLeft, AlignBottom, buffer);
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "B2:%u C3:%u C1:%u C0:%u",
+        (app->current_levels >> 3) & 1,
+        (app->current_levels >> 2) & 1,
+        (app->current_levels >> 1) & 1,
+        (app->current_levels >> 0) & 1);
+    canvas_draw_str_aligned(canvas, 3, 18, AlignLeft, AlignBottom, buffer);
 
+    uint32_t rx_count = 0;
+    uint32_t tx_count = 0;
     if(app->uart) {
         UsbUartState st;
         usb_uart_get_state(app->uart, &st);
-
-        snprintf(buffer, sizeof(buffer), "Rx %ld | Tx %ld", st.rx_cnt, st.tx_cnt);
-        canvas_draw_str_aligned(canvas, 5, y, AlignLeft, AlignBottom, buffer);
-        y += 20;
+        rx_count = st.rx_cnt;
+        tx_count = st.tx_cnt;
     }
-    canvas_set_font(canvas, FontSecondary);
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "G:%02X RX:%04lX TX:%04lX",
+        app->current_levels,
+        (unsigned long)(rx_count & 0xFFFF),
+        (unsigned long)(tx_count & 0xFFFF));
+    canvas_draw_str_aligned(canvas, 3, 28, AlignLeft, AlignBottom, buffer);
 
     if(app->sump) {
-        snprintf(
-            buffer,
-            sizeof(buffer),
-            "%02X %lX %ld %lX %lX %X",
-            app->sump->flags,
-            app->sump->divider,
-            app->sump->delay_count,
-            app->sump->trig_mask,
-            app->sump->trig_values,
-            app->sump->trig_config);
-
-        canvas_draw_str_aligned(canvas, 5, y, AlignLeft, AlignBottom, buffer);
-        y += 10;
-
         if(app->sump->armed) {
+            if(app->triggered) {
+                snprintf(
+                    buffer,
+                    sizeof(buffer),
+                    "CAP %u/%lu F:%02X",
+                    app->capture_pos,
+                    (unsigned long)app->sump->read_count,
+                    app->sump->flags);
+            } else {
+                snprintf(buffer, sizeof(buffer), "WAIT TRIGGER F:%02X", app->sump->flags);
+            }
+        } else if(app->last_capture_count) {
             snprintf(
                 buffer,
                 sizeof(buffer),
-                "Captured: %u / %ld",
-                app->capture_pos,
-                app->sump->read_count);
-            canvas_draw_str_aligned(canvas, 5, y, AlignLeft, AlignBottom, buffer);
-            y += 20;
+                "SENT %u F:%02X",
+                (unsigned int)app->last_capture_count,
+                app->sump->flags);
+        } else {
+            snprintf(buffer, sizeof(buffer), "READY F:%02X", app->sump->flags);
         }
+        canvas_draw_str_aligned(canvas, 3, 38, AlignLeft, AlignBottom, buffer);
 
-        if(app->sump->armed) {
-            elements_button_center(canvas, "Trigger");
+        uint32_t sample_rate = SUMP_CLOCK_HZ / (app->sump->divider + 1U);
+        if(sample_rate >= 1000) {
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "RATE:%lukHz N:%lu",
+                (unsigned long)(sample_rate / 1000),
+                (unsigned long)app->sump->read_count);
+        } else {
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "RATE:%luHz N:%lu",
+                (unsigned long)sample_rate,
+                (unsigned long)app->sump->read_count);
         }
+        canvas_draw_str_aligned(canvas, 3, 48, AlignLeft, AlignBottom, buffer);
+
+        snprintf(
+            buffer,
+            sizeof(buffer),
+            "D:%06lX M:%02lX V:%02lX",
+            (unsigned long)(app->sump->divider & 0xFFFFFF),
+            (unsigned long)(app->sump->trig_mask & 0xFF),
+            (unsigned long)(app->sump->trig_values & 0xFF));
+        canvas_draw_str_aligned(canvas, 3, 58, AlignLeft, AlignBottom, buffer);
     }
 
     furi_mutex_release(app->mutex);
@@ -199,25 +245,38 @@ static int32_t capture_thread_worker(void* context) {
         app->current_levels = levels_get(app);
 
         if(app->sump->armed) {
-            uint8_t relevant_levels = app->current_levels & app->sump->trig_mask;
-            uint8_t prev_relevant_levels = prev_levels & app->sump->trig_mask;
+            uint8_t trigger_mask = app->sump->trig_mask & 0xFF;
 
-            if(relevant_levels != prev_relevant_levels) {
+            if(!app->triggered) {
+                app->triggered =
+                    (trigger_mask == 0) ||
+                    ((app->current_levels & trigger_mask) != (prev_levels & trigger_mask));
                 prev_levels = app->current_levels;
-                app->capture_buffer[app->sump->read_count - 1 - app->capture_pos++] =
-                    app->current_levels;
 
-                if(app->capture_pos >= app->sump->read_count) {
-                    app->sump->armed = false;
-                    AppEvent event = {.type = EventBufferFilled};
-                    furi_message_queue_put(app->event_queue, &event, 100);
+                if(!app->triggered) {
+                    furi_delay_us(10);
+                    continue;
                 }
+            }
+
+            uint32_t sample_period_us =
+                (app->sump->divider + SUMP_CLOCK_MHZ) / SUMP_CLOCK_MHZ;
+
+            app->capture_buffer[app->sump->read_count - 1 - app->capture_pos++] =
+                app->current_levels;
+
+            if(app->capture_pos >= app->sump->read_count) {
+                app->last_capture_count = app->capture_pos;
+                app->sump->armed = false;
+                AppEvent event = {.type = EventBufferFilled};
+                furi_message_queue_put(app->event_queue, &event, 100);
+            } else {
+                furi_delay_us(sample_period_us);
             }
         } else {
             prev_levels = app->current_levels;
             app->capture_pos = 0;
             app->triggered = false;
-            prev_levels = 0;
             furi_delay_ms(50);
         }
     }
@@ -251,7 +310,7 @@ static bool app_init(AppFSM* const app) {
 
     UsbUartConfig uart_config;
 
-    uart_config.vcp_ch = 1;
+    uart_config.vcp_ch = 0;
     uart_config.rx_data = &data_received;
     uart_config.rx_data_ctx = app;
 
@@ -275,12 +334,13 @@ static bool app_init(AppFSM* const app) {
 static void app_deinit(AppFSM* const app) {
     view_port_enabled_set(app->view_port, false);
     gui_remove_view_port(app->gui, app->view_port);
-    view_port_free(app->view_port);
-    furi_message_queue_free(app->event_queue);
-    furi_mutex_free(app->mutex);
 
     furi_thread_join(app->capture_thread);
     furi_thread_free(app->capture_thread);
+
+    view_port_free(app->view_port);
+    furi_message_queue_free(app->event_queue);
+    furi_mutex_free(app->mutex);
 
     free(app->capture_buffer);
 
@@ -297,7 +357,7 @@ static void app_deinit(AppFSM* const app) {
 int32_t logic_analyzer_app_main(void* p) {
     UNUSED(p);
 
-    AppFSM* app = malloc(sizeof(AppFSM));
+    AppFSM* app = calloc(1, sizeof(AppFSM));
     app_init(app);
 
     dolphin_deed(DolphinDeedPluginGameStart);

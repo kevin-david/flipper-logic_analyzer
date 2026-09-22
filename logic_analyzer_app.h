@@ -51,6 +51,7 @@ typedef struct {
     FuriThread* capture_thread;
     uint8_t* capture_buffer;
     size_t capture_pos;
+    size_t last_capture_count;
     uint8_t current_levels;
 
     char state_string[64];
