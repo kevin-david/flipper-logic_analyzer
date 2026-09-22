@@ -1,6 +1,9 @@
 
 #include <furi.h>
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "sump.h"
 
 void sump_handle_query(Sump* sump) {
@@ -18,7 +21,8 @@ void sump_handle_get_metadata(Sump* sump) {
     uint32_t max_sample_rate = 100000;
     uint32_t max_sample_mem = sump->max_sample_count;
 
-    /* 0x01 	device name (e.g. "Openbench Logic Sniffer v1.0", "Bus Pirate v3b"  */
+    /* 0x01 	device name (e.g. "Openbench Logic Sniffer v1.0", "Bus Pirate
+   * v3b"  */
     buf[pos++] = 0x01;
     strcpy((char*)&buf[pos], name);
     pos += strlen(name) + 1;
@@ -61,12 +65,36 @@ void sump_handle_get_metadata(Sump* sump) {
     sump->tx_data(sump->tx_data_ctx, buf, pos);
 }
 
-uint32_t get_word(uint8_t* data) {
-    return (data[3] << 24) | (data[2] << 16) | (data[1] << 8) | (data[0] << 0);
+static uint32_t get_word(const uint8_t* data) {
+    return ((uint32_t)data[3] << 24) | ((uint32_t)data[2] << 16) | ((uint32_t)data[1] << 8) |
+           (uint32_t)data[0];
 }
 
-size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
+static bool sump_handle_trigger_command(Sump* sump, uint8_t command, uint32_t extra) {
+    if(command < SUMP_CMD_TRIGGER_MASK || command > 0xCE) {
+        return false;
+    }
+
+    uint8_t offset = command - SUMP_CMD_TRIGGER_MASK;
+    uint8_t stage = offset / 4U;
+    uint8_t field = offset % 4U;
+    if(stage >= SUMP_TRIGGER_STAGE_COUNT || field > 2U) {
+        return false;
+    }
+
+    if(field == 0U) {
+        sump->trig_mask[stage] = extra;
+    } else if(field == 1U) {
+        sump->trig_values[stage] = extra;
+    } else {
+        sump->trig_config[stage] = extra;
+    }
+    return true;
+}
+
+SumpHandleResult sump_handle(Sump* sump, const uint8_t* data, size_t length) {
     size_t pos = 0;
+    SumpCaptureCommand capture_command = SumpCaptureCommandNone;
 
     while(pos < length) {
         uint8_t command = data[pos];
@@ -74,7 +102,10 @@ size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
 
         if(command & 0x80) {
             if(length - pos < 5) {
-                return pos;
+                return (SumpHandleResult){
+                    .consumed = pos,
+                    .capture_command = capture_command,
+                };
             }
             pos++;
             extra = get_word(&data[pos]);
@@ -83,13 +114,22 @@ size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
             pos++;
         }
 
+        if(sump_handle_trigger_command(sump, command, extra)) {
+            continue;
+        }
+
         switch(command) {
         case SUMP_CMD_RESET:
             sump->armed = false;
+            memset(sump->trig_mask, 0, sizeof(sump->trig_mask));
+            memset(sump->trig_values, 0, sizeof(sump->trig_values));
+            memset(sump->trig_config, 0, sizeof(sump->trig_config));
+            capture_command = SumpCaptureCommandAbort;
             break;
 
         case SUMP_CMD_ARM:
             sump->armed = true;
+            capture_command = SumpCaptureCommandArm;
             break;
 
         case SUMP_CMD_QUERY_ID:
@@ -105,6 +145,7 @@ size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
 
         case SUMP_CMD_FINISH_NOW:
             sump->armed = false;
+            capture_command = SumpCaptureCommandFinish;
             break;
 
         case SUMP_CMD_XON:
@@ -127,19 +168,9 @@ size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
 
         case SUMP_CMD_SET_DIVIDER:
             sump->divider = extra & 0xFFFFFF;
-            break;
-
-        case SUMP_CMD_TRIGGER_MASK:
-            sump->trig_mask = extra;
-            break;
-
-        case SUMP_CMD_TRIGGER_VALUES:
-            sump->trig_values = extra;
-            break;
-
-        case SUMP_CMD_TRIGGER_CONFIG:
-            sump->trig_delay = (extra >> 16);
-            sump->trig_config = (extra & 0xFFFF);
+            if(sump->divider < SUMP_MIN_DIVIDER) {
+                sump->divider = SUMP_MIN_DIVIDER;
+            }
             break;
 
         default:
@@ -147,12 +178,15 @@ size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
         }
     }
 
-    return pos;
+    return (SumpHandleResult){
+        .consumed = pos,
+        .capture_command = capture_command,
+    };
 }
 
 Sump* sump_alloc(uint32_t max_sample_count) {
-    if((max_sample_count < 4U) || (max_sample_count > SUMP_MAX_SAMPLE_COUNT) ||
-       ((max_sample_count & 0x3U) != 0U)) {
+    if(max_sample_count < 4U || max_sample_count > SUMP_MAX_SAMPLE_COUNT ||
+       (max_sample_count & 0x3U) != 0U) {
         return NULL;
     }
 
@@ -163,7 +197,8 @@ Sump* sump_alloc(uint32_t max_sample_count) {
 
     sump->max_sample_count = max_sample_count;
     sump->read_count = max_sample_count;
-    sump->divider = 999;
+    sump->delay_count = max_sample_count;
+    sump->divider = SUMP_MIN_DIVIDER;
 
     return sump;
 }

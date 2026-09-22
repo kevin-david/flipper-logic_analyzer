@@ -219,8 +219,8 @@ static void render_callback(Canvas* const canvas, void* cb_ctx) {
             sizeof(buffer),
             "D:%06lX M:%02lX V:%02lX",
             (unsigned long)(app->sump->divider & 0xFFFFFF),
-            (unsigned long)(app->sump->trig_mask & 0xFF),
-            (unsigned long)(app->sump->trig_values & 0xFF));
+            (unsigned long)(app->sump->trig_mask[0] & 0xFF),
+            (unsigned long)(app->sump->trig_values[0] & 0xFF));
         canvas_draw_str_aligned(canvas, 3, 58, AlignLeft, AlignBottom, buffer);
     }
 
@@ -319,10 +319,10 @@ size_t data_received(void* ctx, uint8_t* data, size_t length) {
         data[0],
         length);
 
-    size_t handled = sump_handle(app->sump, data, length);
+    SumpHandleResult result = sump_handle(app->sump, data, length);
     furi_mutex_release(app->mutex);
 
-    return handled;
+    return result.consumed;
 }
 
 void tx_sump_tx(void* ctx, uint8_t* data, size_t length) {
@@ -356,7 +356,7 @@ static int32_t capture_thread_worker(void* context) {
         app->current_levels = levels_get(app);
 
         if(app->sump->armed) {
-            uint8_t trigger_mask = app->sump->trig_mask & 0xFF;
+            uint8_t trigger_mask = app->sump->trig_mask[0] & 0xFF;
 
             if(!app->triggered) {
                 app->triggered =
