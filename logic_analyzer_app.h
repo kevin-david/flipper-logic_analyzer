@@ -66,7 +66,7 @@ typedef struct {
     Sump* sump;
 
     FuriMutex* mutex;
-    bool triggered;
+    FuriSemaphore* arm_display_sem;
     bool processing;
     bool capture_active;
     bool test_clock_enabled;
@@ -78,7 +78,6 @@ typedef struct {
     size_t heap_max_block_before_capture;
     CaptureConfig pending_capture;
     CaptureConfig active_capture;
-    size_t capture_pos;
     size_t last_capture_count;
     uint8_t current_levels;
 

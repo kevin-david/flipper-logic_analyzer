@@ -89,12 +89,33 @@ static void render_callback(Canvas* const canvas, void* cb_ctx) {
 
     furi_mutex_acquire(app->mutex, FuriWaitForever);
 
-    if(!app->processing || app->capture_active) {
+    if(!app->processing) {
         furi_mutex_release(app->mutex);
         return;
     }
 
     char buffer[64];
+    if(app->sump && app->sump->armed) {
+        bool waiting_for_trigger = false;
+        for(uint8_t stage = 0; stage < app->pending_capture.trigger_stage_count; stage++) {
+            waiting_for_trigger |= app->pending_capture.trigger_mask[stage] != 0;
+        }
+        canvas_draw_frame(canvas, 0, 0, 128, 64);
+        canvas_set_font(canvas, FontKeyboard);
+        canvas_draw_str_aligned(
+            canvas,
+            3,
+            20,
+            AlignLeft,
+            AlignBottom,
+            waiting_for_trigger ? "ARMED: WAIT TRIG" : "CAPTURING");
+        snprintf(buffer, sizeof(buffer), "N:%lu OK:END", (unsigned long)app->pending_capture.sample_count);
+        canvas_draw_str_aligned(canvas, 3, 38, AlignLeft, AlignBottom, buffer);
+        furi_semaphore_release(app->arm_display_sem);
+        furi_mutex_release(app->mutex);
+        return;
+    }
+
     app->current_levels = levels_get(app);
     canvas_draw_frame(canvas, 0, 0, 128, 64);
     canvas_set_font(canvas, FontKeyboard);
@@ -135,19 +156,7 @@ static void render_callback(Canvas* const canvas, void* cb_ctx) {
     canvas_draw_str_aligned(canvas, 3, 28, AlignLeft, AlignBottom, buffer);
 
     if(app->sump) {
-        if(app->capture_active) {
-            if(app->triggered) {
-                snprintf(
-                    buffer,
-                    sizeof(buffer),
-                    "CAP %u/%lu F:%02X",
-                    app->capture_pos,
-                    (unsigned long)app->active_capture.sample_count,
-                    app->sump->flags);
-            } else {
-                snprintf(buffer, sizeof(buffer), "WAIT TRIG OK:END");
-            }
-        } else if(app->last_capture_count) {
+        if(app->last_capture_count) {
             snprintf(
                 buffer,
                 sizeof(buffer),
@@ -309,6 +318,11 @@ size_t data_received(void* ctx, uint8_t* data, size_t length) {
 
     switch(result.capture_command) {
     case SumpCaptureCommandArm:
+        (void)furi_semaphore_acquire(app->arm_display_sem, 0);
+        view_port_update(app->view_port);
+        if(furi_semaphore_acquire(app->arm_display_sem, 200) != FuriStatusOk) {
+            FURI_LOG_W(TAG, "Capture status display did not acknowledge arm");
+        }
         furi_thread_flags_set(furi_thread_get_id(app->capture_thread), CaptureEventArm);
         break;
     case SumpCaptureCommandFinish:
@@ -348,8 +362,6 @@ static uint8_t levels_get(AppFSM* app) {
 static void capture_set_inactive(AppFSM* app) {
     furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
     app->capture_active = false;
-    app->triggered = false;
-    app->capture_pos = 0;
     app->sump->armed = false;
     furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
 }
@@ -360,8 +372,6 @@ static void capture_complete(AppFSM* app, CaptureState* capture) {
 
     furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
     app->capture_active = false;
-    app->triggered = capture->triggered;
-    app->capture_pos = captured_count;
     app->last_capture_count = captured_count;
     app->sump->armed = false;
     furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
@@ -390,7 +400,6 @@ static int32_t capture_thread_worker(void* context) {
     CaptureState capture = {0};
     CaptureClock clock = {0};
     bool active = false;
-    size_t status_counter = 0;
     uint8_t trigger_stage = 0;
     bool elevated = false;
 
@@ -424,8 +433,6 @@ static int32_t capture_thread_worker(void* context) {
             app->active_capture = app->pending_capture;
             CaptureConfig config = app->active_capture;
             app->capture_active = true;
-            app->triggered = false;
-            app->capture_pos = 0;
             furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
 
             furi_check(capture_state_init(
@@ -436,7 +443,6 @@ static int32_t capture_thread_worker(void* context) {
                 furi_hal_cortex_instructions_per_microsecond(),
                 DWT->CYCCNT);
             active = true;
-            status_counter = 0;
             trigger_stage = 0;
             bool has_level_trigger = false;
             for(uint8_t stage = 0; stage < config.trigger_stage_count; stage++) {
@@ -461,9 +467,6 @@ static int32_t capture_thread_worker(void* context) {
                 trigger_stage++;
                 if(trigger_stage >= app->active_capture.trigger_stage_count) {
                     capture_state_trigger(&capture);
-                    furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
-                    app->triggered = true;
-                    furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
                     capture_priority_set(
                         &elevated, capture_is_short_burst(&app->active_capture));
                 } else {
@@ -475,12 +478,6 @@ static int32_t capture_thread_worker(void* context) {
         }
 
         bool completed = capture.triggered && capture_state_add_posttrigger(&capture, sample);
-        status_counter++;
-        if((status_counter & 0x3FFU) == 0) {
-            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
-            app->capture_pos = capture_state_progress(&capture);
-            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
-        }
         if(completed) {
             capture_priority_set(&elevated, false);
             capture_complete(app, &capture);
@@ -499,9 +496,10 @@ static int32_t capture_thread_worker(void* context) {
 
 static bool app_init(AppFSM* const app) {
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    app->arm_display_sem = furi_semaphore_alloc(1, 0);
 
-    if(!app->mutex) {
-        FURI_LOG_E(TAG, "cannot create mutex\r\n");
+    if(!app->mutex || !app->arm_display_sem) {
+        FURI_LOG_E(TAG, "cannot create capture synchronization\r\n");
         return false;
     }
 
@@ -583,6 +581,7 @@ static void app_deinit(AppFSM* const app) {
     if(app->view_port) view_port_free(app->view_port);
     if(app->event_queue) furi_message_queue_free(app->event_queue);
     if(app->mutex) furi_mutex_free(app->mutex);
+    if(app->arm_display_sem) furi_semaphore_free(app->arm_display_sem);
     free(app->capture_buffer);
     if(app->sump) sump_free(app->sump);
 
@@ -615,7 +614,10 @@ int32_t logic_analyzer_app_main(void* p) {
         app->processing = processing;
         furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
 
-        if(processing) view_port_update(app->view_port);
+        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+        bool redraw_idle = processing && !app->sump->armed;
+        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+        if(redraw_idle) view_port_update(app->view_port);
     }
 
     notification_message_block(app->notification, &sequence_display_backlight_enforce_auto);
