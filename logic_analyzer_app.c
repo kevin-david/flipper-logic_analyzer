@@ -434,7 +434,6 @@ static bool app_init(AppFSM* const app) {
 
     UsbUartConfig uart_config;
 
-    uart_config.vcp_ch = 0;
     uart_config.rx_data = &data_received;
     uart_config.rx_data_ctx = app;
 

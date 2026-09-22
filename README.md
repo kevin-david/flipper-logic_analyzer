@@ -13,7 +13,10 @@ I'm in the process of bringing this in line with the latest flipper firmwares. R
        pulseview -d ols:conn=/dev/ttyACM1
 
 #### continued instructions from the original developer:
-Then start PulseView and add a new "Openbench Logic Sniffer (ols)" and select the Flipper serial port.
+Then start PulseView and add a new "Openbench Logic Sniffer (ols)" and select
+the second Flipper serial port. The first port remains available for the
+Flipper CLI. Port numbers depend on the host, so check them after launching
+the app rather than assuming `/dev/ttyACM1`.
 
 When arming, you can now look at the trace in PulseView.
 
