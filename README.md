@@ -37,10 +37,14 @@ Changes:
  - sample rates up to 100 kHz use absolute CPU-cycle deadlines so loop overhead
    is included in each interval rather than added to it
  - capture starts immediately when no trigger is configured
- - if a trigger mask is defined, capture starts when a selected signal changes
+ - masked trigger values and up to four sequential SUMP trigger stages are supported
+ - the requested capture ratio retains pre-trigger samples in a circular buffer;
+   ring ordering is finalized after sampling to avoid a trigger-time gap
  - sample capacity is sized at startup from the largest contiguous heap block;
    the app reserves 32 KiB for firmware services, requires space for at least
    16,384 samples, and reports the resulting capacity to PulseView
+ - the second USB serial port carries analyzer data while the first remains
+   available for the Flipper CLI
 
 Discussion thread: https://discord.com/channels/740930220399525928/1074401633615749230
  
