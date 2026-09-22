@@ -37,13 +37,11 @@ typedef enum {
 
 typedef enum {
     EventKeyPress,
-    EventBufferFilled
 } EventType;
 
 typedef struct {
     EventType type;
     InputEvent input;
-    size_t capture_count;
 } AppEvent;
 
 typedef struct {

@@ -327,13 +327,6 @@ static bool message_process(AppFSM* app) {
         break;
     }
 
-    case EventBufferFilled: {
-        if(!usb_uart_tx_data(app->uart, app->capture_buffer, event.capture_count)) {
-            FURI_LOG_W(TAG, "Capture transfer stopped: USB host did not read data");
-        }
-        break;
-    }
-
     default: {
         break;
     }
@@ -347,6 +340,10 @@ size_t data_received(void* ctx, uint8_t* data, size_t length) {
     CaptureCommand command = {.type = CaptureCommandNone};
 
     furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+    if(!app->processing) {
+        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+        return length;
+    }
     SumpHandleResult result = sump_handle(app->sump, data, length);
 
     if(result.capture_command == SumpCaptureCommandArm) {
@@ -473,13 +470,9 @@ static void capture_complete(
     }
     furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
 
-    if(!is_current) return;
-
-    AppEvent event = {
-        .type = EventBufferFilled,
-        .capture_count = capture->sample_count,
-    };
-    furi_message_queue_put(app->event_queue, &event, 100);
+    if(is_current && !usb_uart_tx_data(app->uart, capture->buffer, capture->sample_count)) {
+        FURI_LOG_W(TAG, "Capture transfer stopped: USB host did not read data");
+    }
 }
 
 static bool capture_is_short_burst(const CaptureConfig* config) {
@@ -494,18 +487,24 @@ static void capture_priority_set(bool* elevated, bool requested) {
     *elevated = requested;
 }
 
-static uint32_t capture_run_immediate(AppFSM* app, CaptureState* capture, CaptureClock* clock) {
-    uint32_t overrun_count = 0;
+static bool capture_run_immediate(
+    AppFSM* app,
+    CaptureState* capture,
+    CaptureClock* clock,
+    uint32_t* overrun_count) {
     capture_state_trigger(capture);
 
-    for(size_t position = 0; position < capture->sample_count; position++) {
+    for(size_t position = capture->posttrigger_filled; position < capture->sample_count; position++) {
         capture->buffer[position] = levels_get(app);
-        if(position + 1U == capture->sample_count) break;
+        capture->posttrigger_filled = position + 1U;
+        if(capture->posttrigger_filled == capture->sample_count) return true;
+
+        if(usb_uart_rx_pending(app->uart)) return false;
 
         uint32_t deadline = capture_clock_advance(clock);
         uint32_t current_cycle = DWT->CYCCNT;
         if(capture_clock_restart_after_overrun(clock, current_cycle)) {
-            overrun_count++;
+            (*overrun_count)++;
             deadline = clock->deadline;
         }
         while((int32_t)(DWT->CYCCNT - deadline) < 0) {
@@ -513,8 +512,7 @@ static uint32_t capture_run_immediate(AppFSM* app, CaptureState* capture, Captur
         }
     }
 
-    capture->posttrigger_filled = capture->sample_count;
-    return overrun_count;
+    return true;
 }
 
 static int32_t capture_thread_worker(void* context) {
@@ -530,8 +528,11 @@ static int32_t capture_thread_worker(void* context) {
 
     while(true) {
         CaptureCommand command = {.type = CaptureCommandNone};
-        if(!active || !elevated) {
-            // Command producers cannot run while this thread has highest priority.
+        if(!active || !elevated || usb_uart_rx_pending(app->uart)) {
+            if(elevated) {
+                capture_priority_set(&elevated, false);
+                furi_delay_tick(1);
+            }
             FuriStatus status = furi_message_queue_get(
                 app->capture_commands, &command, active ? 0 : FuriWaitForever);
             if(status != FuriStatusOk && status != FuriStatusErrorTimeout &&
@@ -578,19 +579,33 @@ static int32_t capture_thread_worker(void* context) {
             active_generation = command.generation;
             overrun_count = 0;
             trigger_stage = 0;
-            bool bounded_immediate = !config.has_trigger && capture_is_short_burst(&config);
-            capture_priority_set(&elevated, bounded_immediate);
-            if(bounded_immediate) {
-                overrun_count = capture_run_immediate(app, &capture, &clock);
-                capture_priority_set(&elevated, false);
-                capture_complete(app, &capture, active_generation, overrun_count);
-                active = false;
-                continue;
-            }
         }
 
         if(!active) {
             continue;
+        }
+
+        if(!config.has_trigger && capture_is_short_burst(&config)) {
+            if(usb_uart_rx_pending(app->uart)) {
+                furi_delay_tick(1);
+                continue;
+            }
+            capture_priority_set(&elevated, true);
+            bool completed = capture_run_immediate(app, &capture, &clock, &overrun_count);
+            if(completed) {
+                capture_priority_set(&elevated, false);
+                capture_complete(app, &capture, active_generation, overrun_count);
+                active = false;
+            }
+            continue;
+        }
+
+        if(capture.triggered && capture_is_short_burst(&config)) {
+            if(usb_uart_rx_pending(app->uart)) {
+                furi_delay_tick(1);
+                continue;
+            }
+            capture_priority_set(&elevated, true);
         }
 
         uint8_t sample = levels_get(app);
@@ -620,6 +635,8 @@ static int32_t capture_thread_worker(void* context) {
             active = false;
             continue;
         }
+
+        if(elevated && usb_uart_rx_pending(app->uart)) continue;
 
         uint32_t deadline = capture_clock_advance(&clock);
         uint32_t current_cycle = DWT->CYCCNT;
@@ -705,10 +722,6 @@ static void app_deinit(AppFSM* const app) {
         }
     }
 
-    if(app->uart) {
-        usb_uart_disable(app->uart);
-    }
-
     if(app->capture_thread) {
         CaptureCommand command = {.type = CaptureCommandStop};
         furi_check(
@@ -716,6 +729,10 @@ static void app_deinit(AppFSM* const app) {
             FuriStatusOk);
         furi_thread_join(app->capture_thread);
         furi_thread_free(app->capture_thread);
+    }
+
+    if(app->uart) {
+        usb_uart_disable(app->uart);
     }
 
     if(app->test_clock_enabled) test_clock_set(app, false);

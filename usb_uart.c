@@ -26,8 +26,11 @@ struct UsbUart {
 
     FuriThread* thread;
     FuriMutex* usb_mutex;
+    FuriMutex* tx_mutex;
     FuriSemaphore* tx_sem;
     UsbUartState st;
+    uint32_t rx_epoch;
+    uint32_t rx_processed_epoch;
 };
 
 static void vcp_on_cdc_tx_complete(void* context);
@@ -54,6 +57,8 @@ static void usb_uart_vcp_deinit(void) {
 }
 
 bool usb_uart_tx_data(UsbUart* usb_uart, uint8_t* data, size_t length) {
+    furi_check(furi_mutex_acquire(usb_uart->tx_mutex, FuriWaitForever) == FuriStatusOk);
+    bool sent = true;
     uint32_t pos = 0;
     while(pos < length) {
         size_t pkt_size = length - pos;
@@ -63,7 +68,8 @@ bool usb_uart_tx_data(UsbUart* usb_uart, uint8_t* data, size_t length) {
         }
 
         if(furi_semaphore_acquire(usb_uart->tx_sem, USB_TX_TIMEOUT_MS) != FuriStatusOk) {
-            return false;
+            sent = false;
+            break;
         }
 
         furi_check(furi_mutex_acquire(usb_uart->usb_mutex, FuriWaitForever) == FuriStatusOk);
@@ -72,7 +78,13 @@ bool usb_uart_tx_data(UsbUart* usb_uart, uint8_t* data, size_t length) {
         furi_check(furi_mutex_release(usb_uart->usb_mutex) == FuriStatusOk);
         pos += pkt_size;
     }
-    return true;
+    furi_check(furi_mutex_release(usb_uart->tx_mutex) == FuriStatusOk);
+    return sent;
+}
+
+bool usb_uart_rx_pending(const UsbUart* usb_uart) {
+    return __atomic_load_n(&usb_uart->rx_epoch, __ATOMIC_ACQUIRE) !=
+           __atomic_load_n(&usb_uart->rx_processed_epoch, __ATOMIC_ACQUIRE);
 }
 
 static int32_t usb_uart_worker(void* context) {
@@ -95,6 +107,7 @@ static int32_t usb_uart_worker(void* context) {
         }
 
         if(events & WorkerEvtCdcRx) {
+            uint32_t rx_epoch = __atomic_load_n(&usb_uart->rx_epoch, __ATOMIC_ACQUIRE);
             furi_check(furi_mutex_acquire(usb_uart->usb_mutex, FuriWaitForever) == FuriStatusOk);
             size_t len =
                 furi_hal_cdc_receive(USB_ANALYZER_CDC_CHANNEL, &data[remain], USB_CDC_PKT_LEN);
@@ -109,6 +122,7 @@ static int32_t usb_uart_worker(void* context) {
                 memcpy(data, &data[handled], remain - handled);
                 remain -= handled;
             }
+            __atomic_store_n(&usb_uart->rx_processed_epoch, rx_epoch, __ATOMIC_RELEASE);
         }
     }
     usb_uart_vcp_deinit();
@@ -127,6 +141,7 @@ static void vcp_on_cdc_tx_complete(void* context) {
 
 static void vcp_on_cdc_rx(void* context) {
     UsbUart* usb_uart = (UsbUart*)context;
+    __atomic_add_fetch(&usb_uart->rx_epoch, 1U, __ATOMIC_RELEASE);
     furi_thread_flags_set(furi_thread_get_id(usb_uart->thread), WorkerEvtCdcRx);
 }
 
@@ -154,7 +169,9 @@ UsbUart* usb_uart_enable(UsbUartConfig* cfg) {
 
     usb_uart->tx_sem = furi_semaphore_alloc(1, 1);
     usb_uart->usb_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
-    if(!usb_uart->tx_sem || !usb_uart->usb_mutex) {
+    usb_uart->tx_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    if(!usb_uart->tx_sem || !usb_uart->usb_mutex || !usb_uart->tx_mutex) {
+        if(usb_uart->tx_mutex) furi_mutex_free(usb_uart->tx_mutex);
         if(usb_uart->usb_mutex) furi_mutex_free(usb_uart->usb_mutex);
         if(usb_uart->tx_sem) furi_semaphore_free(usb_uart->tx_sem);
         free(usb_uart);
@@ -163,6 +180,7 @@ UsbUart* usb_uart_enable(UsbUartConfig* cfg) {
 
     usb_uart->thread = furi_thread_alloc_ex("UsbUartWorker", 1024, usb_uart_worker, usb_uart);
     if(!usb_uart->thread) {
+        furi_mutex_free(usb_uart->tx_mutex);
         furi_mutex_free(usb_uart->usb_mutex);
         furi_semaphore_free(usb_uart->tx_sem);
         free(usb_uart);
@@ -177,6 +195,7 @@ void usb_uart_disable(UsbUart* usb_uart) {
     furi_thread_flags_set(furi_thread_get_id(usb_uart->thread), WorkerEvtStop);
     furi_thread_join(usb_uart->thread);
     furi_thread_free(usb_uart->thread);
+    furi_mutex_free(usb_uart->tx_mutex);
     furi_mutex_free(usb_uart->usb_mutex);
     furi_semaphore_free(usb_uart->tx_sem);
     free(usb_uart);
