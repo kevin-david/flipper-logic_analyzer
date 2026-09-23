@@ -2,9 +2,106 @@
 
 #include "logic_analyzer_app.h"
 
-#define COUNT(x) ((size_t)(sizeof(x) / sizeof((x)[0])))
+#include <furi_hal_cortex.h>
+#include <furi_hal_pwm.h>
+
+#define COUNT(x)                          ((size_t)(sizeof(x) / sizeof((x)[0])))
+#define CAPTURE_MIN_SAMPLE_COUNT          16384U
+#define CAPTURE_HEAP_RESERVE              (32U * 1024U)
+#define CAPTURE_ALLOCATION_STEP           (4U * 1024U)
+#define CAPTURE_COMMAND_QUEUE_SIZE        8U
+#define TEST_CLOCK_FREQUENCY_HZ           10000U
+#define CAPTURE_HIGH_PRIORITY_MAX_SECONDS 1U
 
 static void render_callback(Canvas* const canvas, void* cb_ctx);
+static uint8_t levels_get(AppFSM* app);
+
+static GpioPull input_pull_gpio(InputPullMode pull) {
+    switch(pull) {
+    case InputPullDown:
+        return GpioPullDown;
+    case InputPullUp:
+        return GpioPullUp;
+    case InputPullFloat:
+    default:
+        return GpioPullNo;
+    }
+}
+
+static const char* input_pull_label(InputPullMode pull) {
+    switch(pull) {
+    case InputPullDown:
+        return "DN";
+    case InputPullUp:
+        return "UP";
+    case InputPullFloat:
+    default:
+        return "FLT";
+    }
+}
+
+static InputPullMode input_pull_next(InputPullMode pull) {
+    switch(pull) {
+    case InputPullFloat:
+        return InputPullDown;
+    case InputPullDown:
+        return InputPullUp;
+    case InputPullUp:
+    default:
+        return InputPullFloat;
+    }
+}
+
+static void input_pin_init(const AppFSM* app, const GpioPin* pin) {
+    furi_hal_gpio_init(pin, GpioModeInput, input_pull_gpio(app->input_pull), GpioSpeedVeryHigh);
+}
+
+static void test_clock_set(AppFSM* app, bool enabled) {
+    if(enabled == app->test_clock_enabled) return;
+
+    if(enabled) {
+        furi_hal_pwm_start(FuriHalPwmOutputIdTim1PA7, TEST_CLOCK_FREQUENCY_HZ, 50);
+    } else {
+        furi_hal_pwm_stop(FuriHalPwmOutputIdTim1PA7);
+        input_pin_init(app, &gpio_ext_pa7);
+    }
+    app->test_clock_enabled = enabled;
+}
+
+static bool capture_buffer_alloc(AppFSM* app) {
+    app->heap_free_before_capture = memmgr_get_free_heap();
+    app->heap_max_block_before_capture = memmgr_heap_get_max_free_block();
+
+    size_t target = 0;
+    if(app->heap_max_block_before_capture > CAPTURE_HEAP_RESERVE) {
+        target = app->heap_max_block_before_capture - CAPTURE_HEAP_RESERVE;
+    }
+    if(target > SUMP_MAX_SAMPLE_COUNT) target = SUMP_MAX_SAMPLE_COUNT;
+    target &= ~(size_t)0x3U;
+
+    while(target >= CAPTURE_MIN_SAMPLE_COUNT) {
+        app->capture_buffer = malloc(target);
+        if(app->capture_buffer) {
+            app->capture_capacity = target;
+            FURI_LOG_I(
+                TAG,
+                "Capture heap: free=%lu max_block=%lu reserve=%u allocated=%lu",
+                (unsigned long)app->heap_free_before_capture,
+                (unsigned long)app->heap_max_block_before_capture,
+                CAPTURE_HEAP_RESERVE,
+                (unsigned long)app->capture_capacity);
+            return true;
+        }
+        if(target < CAPTURE_MIN_SAMPLE_COUNT + CAPTURE_ALLOCATION_STEP) break;
+        target = (target - CAPTURE_ALLOCATION_STEP) & ~(size_t)0x3U;
+    }
+    FURI_LOG_E(
+        TAG,
+        "Capture allocation failed: free=%lu max_block=%lu",
+        (unsigned long)app->heap_free_before_capture,
+        (unsigned long)app->heap_max_block_before_capture);
+    return false;
+}
 
 static const GpioPin* gpios[] = {
     &gpio_ext_pc0,
@@ -16,15 +113,20 @@ static const GpioPin* gpios[] = {
     &gpio_ext_pa6,
     &gpio_ext_pa7};
 
-//static const char* gpio_names[] = {"PC0", "PC1", "PC3", "PB2", "PB3", "PA4", "PA6", "PA7"};
+static void input_pull_apply(const AppFSM* app) {
+    for(size_t io = 0; io < COUNT(gpios); io++) {
+        if(app->test_clock_enabled && gpios[io] == &gpio_ext_pa7) continue;
+        input_pin_init(app, gpios[io]);
+    }
+}
 
 static void render_callback(Canvas* const canvas, void* cb_ctx) {
     AppFSM* app = cb_ctx;
-    furi_mutex_acquire(app->mutex, FuriWaitForever);
-
     if(app == NULL) {
         return;
     }
+
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
 
     if(!app->processing) {
         furi_mutex_release(app->mutex);
@@ -32,51 +134,120 @@ static void render_callback(Canvas* const canvas, void* cb_ctx) {
     }
 
     char buffer[64];
-    int y = 10;
-
-    canvas_draw_frame(canvas, 0, 0, 128, 64);
-    canvas_draw_str_aligned(canvas, 5, y, AlignLeft, AlignBottom, "State");
-    y += 10;
-
-    if(app->uart) {
-        UsbUartState st;
-        usb_uart_get_state(app->uart, &st);
-
-        snprintf(buffer, sizeof(buffer), "Rx %ld | Tx %ld", st.rx_cnt, st.tx_cnt);
-        canvas_draw_str_aligned(canvas, 5, y, AlignLeft, AlignBottom, buffer);
-        y += 20;
-    }
-    canvas_set_font(canvas, FontSecondary);
-
-    if(app->sump) {
+    if(app->capture_active) {
+        canvas_draw_frame(canvas, 0, 0, 128, 64);
+        canvas_set_font(canvas, FontKeyboard);
+        canvas_draw_str_aligned(
+            canvas,
+            3,
+            20,
+            AlignLeft,
+            AlignBottom,
+            app->pending_capture.has_trigger ? "ARMED: WAIT TRIG" : "CAPTURING");
         snprintf(
             buffer,
             sizeof(buffer),
-            "%02X %lX %ld %lX %lX %X",
-            app->sump->flags,
-            app->sump->divider,
-            app->sump->delay_count,
-            app->sump->trig_mask,
-            app->sump->trig_values,
-            app->sump->trig_config);
+            "N:%lu OK:END",
+            (unsigned long)app->pending_capture.sample_count);
+        canvas_draw_str_aligned(canvas, 3, 38, AlignLeft, AlignBottom, buffer);
+        furi_semaphore_release(app->arm_display_sem);
+        furi_mutex_release(app->mutex);
+        return;
+    }
 
-        canvas_draw_str_aligned(canvas, 5, y, AlignLeft, AlignBottom, buffer);
-        y += 10;
+    app->current_levels = levels_get(app);
+    canvas_draw_frame(canvas, 0, 0, 128, 64);
+    canvas_set_font(canvas, FontKeyboard);
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "A7:%u A6:%u A4:%u B3:%u",
+        (app->current_levels >> 7) & 1,
+        (app->current_levels >> 6) & 1,
+        (app->current_levels >> 5) & 1,
+        (app->current_levels >> 4) & 1);
+    canvas_draw_str_aligned(canvas, 3, 9, AlignLeft, AlignBottom, buffer);
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "B2:%u C3:%u C1:%u C0:%u",
+        (app->current_levels >> 3) & 1,
+        (app->current_levels >> 2) & 1,
+        (app->current_levels >> 1) & 1,
+        (app->current_levels >> 0) & 1);
+    canvas_draw_str_aligned(canvas, 3, 18, AlignLeft, AlignBottom, buffer);
 
-        if(app->sump->armed) {
+    uint32_t rx_count = 0;
+    uint32_t tx_count = 0;
+    if(app->uart) {
+        UsbUartState st;
+        usb_uart_get_state(app->uart, &st);
+        rx_count = st.rx_cnt;
+        tx_count = st.tx_cnt;
+    }
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "G:%02X RX:%04lX TX:%04lX",
+        app->current_levels,
+        (unsigned long)(rx_count & 0xFFFF),
+        (unsigned long)(tx_count & 0xFFFF));
+    canvas_draw_str_aligned(canvas, 3, 28, AlignLeft, AlignBottom, buffer);
+
+    if(app->sump) {
+        if(app->last_capture_count && app->last_capture_overruns) {
             snprintf(
                 buffer,
                 sizeof(buffer),
-                "Captured: %u / %ld",
-                app->capture_pos,
-                app->sump->read_count);
-            canvas_draw_str_aligned(canvas, 5, y, AlignLeft, AlignBottom, buffer);
-            y += 20;
+                "O:%lu T:%s P:%s",
+                (unsigned long)app->last_capture_overruns,
+                app->test_clock_enabled ? "10K" : "OFF",
+                input_pull_label(app->input_pull));
+        } else if(app->last_capture_count) {
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "S:%u T:%s P:%s",
+                (unsigned int)app->last_capture_count,
+                app->test_clock_enabled ? "10K" : "OFF",
+                input_pull_label(app->input_pull));
+        } else {
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "M:%luK T:%s P:%s",
+                (unsigned long)(app->capture_capacity / 1024U),
+                app->test_clock_enabled ? "10K" : "OFF",
+                input_pull_label(app->input_pull));
         }
+        canvas_draw_str_aligned(canvas, 3, 38, AlignLeft, AlignBottom, buffer);
 
-        if(app->sump->armed) {
-            elements_button_center(canvas, "Trigger");
+        uint32_t sample_rate = SUMP_CLOCK_HZ / (app->sump->divider + 1U);
+        if(sample_rate >= 1000) {
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "RATE:%lukHz N:%lu",
+                (unsigned long)(sample_rate / 1000),
+                (unsigned long)app->sump->read_count);
+        } else {
+            snprintf(
+                buffer,
+                sizeof(buffer),
+                "RATE:%luHz N:%lu",
+                (unsigned long)sample_rate,
+                (unsigned long)app->sump->read_count);
         }
+        canvas_draw_str_aligned(canvas, 3, 48, AlignLeft, AlignBottom, buffer);
+
+        snprintf(
+            buffer,
+            sizeof(buffer),
+            "D:%06lX M:%02lX V:%02lX",
+            (unsigned long)(app->sump->divider & 0xFFFFFF),
+            (unsigned long)(app->sump->trig_mask[0] & 0xFF),
+            (unsigned long)(app->sump->trig_values[0] & 0xFF));
+        canvas_draw_str_aligned(canvas, 3, 58, AlignLeft, AlignBottom, buffer);
     }
 
     furi_mutex_release(app->mutex);
@@ -85,7 +256,7 @@ static void render_callback(Canvas* const canvas, void* cb_ctx) {
 static void input_callback(InputEvent* input_event, void* event_queue) {
     furi_assert((FuriMessageQueue*)event_queue);
 
-    /* better skip than sorry */
+    // Drop input when the queue is full.
     if(furi_message_queue_get_count((FuriMessageQueue*)event_queue) < QUEUE_SIZE) {
         AppEvent event = {.type = EventKeyPress, .input = *input_event};
         furi_message_queue_put((FuriMessageQueue*)event_queue, &event, 100);
@@ -115,20 +286,33 @@ static bool message_process(AppFSM* app) {
             break;
 
         case InputKeyRight:
+            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+            if(!app->capture_active) test_clock_set(app, !app->test_clock_enabled);
+            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
             break;
 
         case InputKeyLeft:
+            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+            if(!app->capture_active) {
+                app->input_pull = input_pull_next(app->input_pull);
+                input_pull_apply(app);
+            }
+            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
             break;
 
         case InputKeyOk:
-            /* when armed, trigger by pressing the button */
-            if(app->sump->armed) {
-                for(size_t pos = app->capture_pos; pos < app->sump->read_count; pos++) {
-                    app->capture_buffer[app->sump->read_count - 1 - pos] = 0;
+            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+            bool capture_active = app->capture_active;
+            uint32_t capture_generation = app->capture_generation;
+            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+            if(capture_active) {
+                CaptureCommand command = {
+                    .type = CaptureCommandFinish,
+                    .generation = capture_generation,
+                };
+                if(furi_message_queue_put(app->capture_commands, &command, 100) != FuriStatusOk) {
+                    FURI_LOG_E(TAG, "Capture command queue is full");
                 }
-                app->sump->armed = false;
-                AppEvent event = {.type = EventBufferFilled};
-                furi_message_queue_put(app->event_queue, &event, 100);
             }
             break;
 
@@ -143,11 +327,6 @@ static bool message_process(AppFSM* app) {
         break;
     }
 
-    case EventBufferFilled: {
-        usb_uart_tx_data(app->uart, app->capture_buffer, app->sump->read_count);
-        break;
-    }
-
     default: {
         break;
     }
@@ -158,22 +337,98 @@ static bool message_process(AppFSM* app) {
 
 size_t data_received(void* ctx, uint8_t* data, size_t length) {
     AppFSM* app = (AppFSM*)ctx;
+    CaptureCommand command = {.type = CaptureCommandNone};
 
-    snprintf(
-        app->state_string,
-        sizeof(app->state_string),
-        "Rx: %02x '%c' (total %u)",
-        data[0],
-        data[0],
-        length);
+    furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+    if(!app->processing) {
+        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+        return length;
+    }
+    SumpHandleResult result = sump_handle(app->sump, data, length);
 
-    return sump_handle(app->sump, data, length);
-}
+    if(result.capture_command == SumpCaptureCommandArm) {
+        size_t sample_count = app->sump->read_count;
+        size_t posttrigger_count = sample_count;
+        uint8_t trigger_stage_count = 1;
+        bool has_trigger = false;
+        for(uint8_t stage = 0; stage < SUMP_TRIGGER_STAGE_COUNT; stage++) {
+            if(app->sump->trig_config[stage] & SUMP_TRIGGER_START_MASK) {
+                trigger_stage_count = stage + 1U;
+                break;
+            }
+        }
+        for(uint8_t stage = 0; stage < trigger_stage_count; stage++) {
+            has_trigger = has_trigger || (app->sump->trig_mask[stage] != 0);
+        }
 
-void tx_sump_tx(void* ctx, uint8_t* data, size_t length) {
-    AppFSM* app = (AppFSM*)ctx;
+        posttrigger_count =
+            capture_posttrigger_count(sample_count, app->sump->delay_count, has_trigger);
 
-    usb_uart_tx_data(app->uart, data, length);
+        app->pending_capture = (CaptureConfig){
+            .sample_count = sample_count,
+            .posttrigger_count = posttrigger_count,
+            .divider = app->sump->divider,
+            .trigger_stage_count = trigger_stage_count,
+            .has_trigger = has_trigger,
+        };
+        for(uint8_t stage = 0; stage < trigger_stage_count; stage++) {
+            app->pending_capture.trigger_mask[stage] = app->sump->trig_mask[stage] & 0xFF;
+            app->pending_capture.trigger_values[stage] = app->sump->trig_values[stage] & 0xFF;
+        }
+        app->capture_generation++;
+        app->capture_active = true;
+        app->last_capture_count = 0;
+        app->last_capture_overruns = 0;
+        command = (CaptureCommand){
+            .type = CaptureCommandArm,
+            .generation = app->capture_generation,
+            .config = app->pending_capture,
+        };
+    } else if(result.capture_command == SumpCaptureCommandFinish) {
+        command = (CaptureCommand){
+            .type = CaptureCommandFinish,
+            .generation = app->capture_generation,
+        };
+    } else if(result.capture_command == SumpCaptureCommandAbort) {
+        command = (CaptureCommand){
+            .type = CaptureCommandAbort,
+            .generation = app->capture_generation,
+        };
+    }
+    furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+
+    uint8_t reply[SUMP_REPLY_BUFFER_SIZE];
+    if(result.replies & SumpReplyId) {
+        size_t reply_size = sump_write_id(reply, sizeof(reply));
+        if(!usb_uart_tx_data(app->uart, reply, reply_size)) {
+            FURI_LOG_W(TAG, "ID reply stopped: USB host did not read data");
+        }
+    }
+    if(result.replies & SumpReplyMetadata) {
+        size_t reply_size = sump_write_metadata(app->sump, reply, sizeof(reply));
+        if(!usb_uart_tx_data(app->uart, reply, reply_size)) {
+            FURI_LOG_W(TAG, "Metadata reply stopped: USB host did not read data");
+        }
+    }
+
+    if(command.type == CaptureCommandArm) {
+        (void)furi_semaphore_acquire(app->arm_display_sem, 0);
+        view_port_update(app->view_port);
+        if(furi_semaphore_acquire(app->arm_display_sem, 200) != FuriStatusOk) {
+            FURI_LOG_W(TAG, "Capture status display did not acknowledge arm");
+        }
+    }
+
+    if(command.type != CaptureCommandNone &&
+       furi_message_queue_put(app->capture_commands, &command, 100) != FuriStatusOk) {
+        FURI_LOG_E(TAG, "Capture command queue is full");
+        if(command.type == CaptureCommandArm) {
+            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+            if(app->capture_generation == command.generation) app->capture_active = false;
+            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+        }
+    }
+    return result.consumed;
 }
 
 static uint8_t levels_get(AppFSM* app) {
@@ -183,7 +438,7 @@ static uint8_t levels_get(AppFSM* app) {
     uint32_t port_c = GPIOC->IDR;
 
     /*   7  6  5  4  3  2  1  0
-        A7 A6 A4 B3 B2 C3 C1 C0 */
+      A7 A6 A4 B3 B2 C3 C1 C0 */
 
     uint8_t ret = (port_a & 0xC0) | ((port_a & 0x10) << 1) | ((port_b & 0x0C) << 1) |
                   ((port_c & 0x08) >> 1) | (port_c & 0x03);
@@ -191,34 +446,206 @@ static uint8_t levels_get(AppFSM* app) {
     return ret;
 }
 
+static void capture_set_inactive(AppFSM* app, uint32_t generation) {
+    furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+    if(app->capture_generation == generation) app->capture_active = false;
+    furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+}
+
+static void capture_complete(
+    AppFSM* app,
+    CaptureState* capture,
+    uint32_t generation,
+    uint32_t overrun_count) {
+    size_t captured_count = capture_state_progress(capture);
+    capture_state_finish(capture);
+
+    furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+    bool is_current = app->capture_generation == generation;
+    if(is_current) {
+        // Do not let an old capture clear a newer arm request.
+        app->capture_active = false;
+        app->last_capture_count = captured_count;
+        app->last_capture_overruns = overrun_count;
+    }
+    furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+
+    if(is_current && !usb_uart_tx_data(app->uart, capture->buffer, capture->sample_count)) {
+        FURI_LOG_W(TAG, "Capture transfer stopped: USB host did not read data");
+    }
+}
+
+static bool capture_is_short_burst(const CaptureConfig* config) {
+    return ((uint64_t)(config->divider + 1U) * config->posttrigger_count) <=
+           ((uint64_t)CAPTURE_HIGH_PRIORITY_MAX_SECONDS * SUMP_CLOCK_HZ);
+}
+
+static void capture_priority_set(bool* elevated, bool requested) {
+    if(*elevated == requested) return;
+    furi_thread_set_current_priority(
+        requested ? FuriThreadPriorityHighest : FuriThreadPriorityNormal);
+    *elevated = requested;
+}
+
+static bool capture_run_immediate(
+    AppFSM* app,
+    CaptureState* capture,
+    CaptureClock* clock,
+    uint32_t* overrun_count) {
+    capture_state_trigger(capture);
+
+    for(size_t position = capture->posttrigger_filled; position < capture->sample_count; position++) {
+        capture->buffer[position] = levels_get(app);
+        capture->posttrigger_filled = position + 1U;
+        if(capture->posttrigger_filled == capture->sample_count) return true;
+
+        if(usb_uart_rx_pending(app->uart)) return false;
+
+        uint32_t deadline = capture_clock_advance(clock);
+        uint32_t current_cycle = DWT->CYCCNT;
+        if(capture_clock_restart_after_overrun(clock, current_cycle)) {
+            (*overrun_count)++;
+            deadline = clock->deadline;
+        }
+        while((int32_t)(DWT->CYCCNT - deadline) < 0) {
+            __NOP();
+        }
+    }
+
+    return true;
+}
+
 static int32_t capture_thread_worker(void* context) {
     AppFSM* app = (AppFSM*)context;
-    uint8_t prev_levels = 0;
+    CaptureState capture = {0};
+    CaptureClock clock = {0};
+    CaptureConfig config = {0};
+    bool active = false;
+    uint8_t trigger_stage = 0;
+    bool elevated = false;
+    uint32_t active_generation = 0;
+    uint32_t overrun_count = 0;
 
-    while(app->processing) {
-        app->current_levels = levels_get(app);
-
-        if(app->sump->armed) {
-            uint8_t relevant_levels = app->current_levels & app->sump->trig_mask;
-            uint8_t prev_relevant_levels = prev_levels & app->sump->trig_mask;
-
-            if(relevant_levels != prev_relevant_levels) {
-                prev_levels = app->current_levels;
-                app->capture_buffer[app->sump->read_count - 1 - app->capture_pos++] =
-                    app->current_levels;
-
-                if(app->capture_pos >= app->sump->read_count) {
-                    app->sump->armed = false;
-                    AppEvent event = {.type = EventBufferFilled};
-                    furi_message_queue_put(app->event_queue, &event, 100);
-                }
+    while(true) {
+        CaptureCommand command = {.type = CaptureCommandNone};
+        if(!active || !elevated || usb_uart_rx_pending(app->uart)) {
+            if(elevated) {
+                capture_priority_set(&elevated, false);
+                furi_delay_tick(1);
             }
-        } else {
-            prev_levels = app->current_levels;
-            app->capture_pos = 0;
-            app->triggered = false;
-            prev_levels = 0;
-            furi_delay_ms(50);
+            FuriStatus status = furi_message_queue_get(
+                app->capture_commands, &command, active ? 0 : FuriWaitForever);
+            if(status != FuriStatusOk && status != FuriStatusErrorTimeout &&
+               status != FuriStatusErrorResource) {
+                furi_crash("Capture command queue failed");
+            }
+        }
+
+        if(command.type == CaptureCommandStop) {
+            capture_priority_set(&elevated, false);
+            break;
+        }
+        if(command.type == CaptureCommandAbort) {
+            if(command.generation != active_generation) continue;
+            capture_priority_set(&elevated, false);
+            active = false;
+            capture_set_inactive(app, command.generation);
+            continue;
+        }
+        if(command.type == CaptureCommandFinish) {
+            if(!active || command.generation != active_generation) continue;
+            capture_priority_set(&elevated, false);
+            capture_complete(app, &capture, active_generation, overrun_count);
+            active = false;
+            continue;
+        }
+        if(command.type == CaptureCommandArm) {
+            furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+            bool is_current = app->capture_generation == command.generation;
+            furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+            if(!is_current) continue;
+
+            capture_priority_set(&elevated, false);
+            config = command.config;
+
+            furi_check(capture_state_init(
+                &capture, app->capture_buffer, config.sample_count, config.posttrigger_count));
+            capture_clock_start(
+                &clock,
+                config.divider,
+                furi_hal_cortex_instructions_per_microsecond(),
+                DWT->CYCCNT);
+            active = true;
+            active_generation = command.generation;
+            overrun_count = 0;
+            trigger_stage = 0;
+        }
+
+        if(!active) {
+            continue;
+        }
+
+        if(!config.has_trigger && capture_is_short_burst(&config)) {
+            if(usb_uart_rx_pending(app->uart)) {
+                furi_delay_tick(1);
+                continue;
+            }
+            capture_priority_set(&elevated, true);
+            bool completed = capture_run_immediate(app, &capture, &clock, &overrun_count);
+            if(completed) {
+                capture_priority_set(&elevated, false);
+                capture_complete(app, &capture, active_generation, overrun_count);
+                active = false;
+            }
+            continue;
+        }
+
+        if(capture.triggered && capture_is_short_burst(&config)) {
+            if(usb_uart_rx_pending(app->uart)) {
+                furi_delay_tick(1);
+                continue;
+            }
+            capture_priority_set(&elevated, true);
+        }
+
+        uint8_t sample = levels_get(app);
+        uint8_t trigger_mask = config.trigger_mask[trigger_stage];
+        bool trigger_matches =
+            (trigger_mask == 0) ||
+            ((sample & trigger_mask) == (config.trigger_values[trigger_stage] & trigger_mask));
+
+        if(!capture.triggered) {
+            if(trigger_matches) {
+                trigger_stage++;
+                if(trigger_stage >= config.trigger_stage_count) {
+                    capture_state_trigger(&capture);
+                    capture_priority_set(&elevated, capture_is_short_burst(&config));
+                } else {
+                    capture_state_add_pretrigger(&capture, sample);
+                }
+            } else {
+                capture_state_add_pretrigger(&capture, sample);
+            }
+        }
+
+        bool completed = capture.triggered && capture_state_add_posttrigger(&capture, sample);
+        if(completed) {
+            capture_priority_set(&elevated, false);
+            capture_complete(app, &capture, active_generation, overrun_count);
+            active = false;
+            continue;
+        }
+
+        if(elevated && usb_uart_rx_pending(app->uart)) continue;
+
+        uint32_t deadline = capture_clock_advance(&clock);
+        uint32_t current_cycle = DWT->CYCCNT;
+        if(capture_clock_restart_after_overrun(&clock, current_cycle)) {
+            overrun_count++;
+            deadline = clock.deadline;
+        }
+        while((int32_t)(DWT->CYCCNT - deadline) < 0) {
+            __NOP();
         }
     }
 
@@ -226,12 +653,13 @@ static int32_t capture_thread_worker(void* context) {
 }
 
 static bool app_init(AppFSM* const app) {
-    strcpy(app->state_string, "none");
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    app->arm_display_sem = furi_semaphore_alloc(1, 0);
+    app->capture_commands =
+        furi_message_queue_alloc(CAPTURE_COMMAND_QUEUE_SIZE, sizeof(CaptureCommand));
 
-    if(!app->mutex) {
-        FURI_LOG_E(TAG, "cannot create mutex\r\n");
-        free(app);
+    if(!app->mutex || !app->arm_display_sem || !app->capture_commands) {
+        FURI_LOG_E(TAG, "cannot create capture synchronization\r\n");
         return false;
     }
 
@@ -244,69 +672,112 @@ static bool app_init(AppFSM* const app) {
 
     app->view_port = view_port_alloc();
     app->event_queue = furi_message_queue_alloc(QUEUE_SIZE, sizeof(AppEvent));
+    if(!app->view_port || !app->event_queue) {
+        return false;
+    }
 
     view_port_draw_callback_set(app->view_port, render_callback, app);
     view_port_input_callback_set(app->view_port, input_callback, app->event_queue);
     gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
 
-    UsbUartConfig uart_config;
-
-    uart_config.vcp_ch = 1;
-    uart_config.rx_data = &data_received;
-    uart_config.rx_data_ctx = app;
-
-    app->uart = usb_uart_enable(&uart_config);
-    app->sump = sump_alloc();
-    app->sump->tx_data = tx_sump_tx;
-    app->sump->tx_data_ctx = app;
-
-    app->capture_buffer = malloc(MAX_SAMPLE_MEM);
-
-    for(size_t io = 0; io < COUNT(gpios); io++) {
-        furi_hal_gpio_init(gpios[io], GpioModeInput, GpioPullNo, GpioSpeedVeryHigh);
+    if(!capture_buffer_alloc(app)) {
+        return false;
     }
 
+    app->sump = sump_alloc(app->capture_capacity);
+    if(!app->sump) {
+        return false;
+    }
+
+    input_pull_apply(app);
+
     app->capture_thread = furi_thread_alloc_ex("capture_thread", 1024, capture_thread_worker, app);
+    if(!app->capture_thread) {
+        return false;
+    }
     furi_thread_start(app->capture_thread);
+
+    UsbUartConfig uart_config = {
+        .rx_data = &data_received,
+        .rx_data_ctx = app,
+    };
+    app->uart = usb_uart_enable(&uart_config);
+    if(!app->uart) {
+        return false;
+    }
 
     return true;
 }
 
 static void app_deinit(AppFSM* const app) {
-    view_port_enabled_set(app->view_port, false);
-    gui_remove_view_port(app->gui, app->view_port);
-    view_port_free(app->view_port);
-    furi_message_queue_free(app->event_queue);
-    furi_mutex_free(app->mutex);
+    if(app->mutex) {
+        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+        app->processing = false;
+        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+    }
+    if(app->view_port) {
+        view_port_enabled_set(app->view_port, false);
+        if(app->gui) {
+            gui_remove_view_port(app->gui, app->view_port);
+        }
+    }
 
-    furi_thread_join(app->capture_thread);
-    furi_thread_free(app->capture_thread);
+    if(app->capture_thread) {
+        CaptureCommand command = {.type = CaptureCommandStop};
+        furi_check(
+            furi_message_queue_put(app->capture_commands, &command, FuriWaitForever) ==
+            FuriStatusOk);
+        furi_thread_join(app->capture_thread);
+        furi_thread_free(app->capture_thread);
+    }
 
+    if(app->uart) {
+        usb_uart_disable(app->uart);
+    }
+
+    if(app->test_clock_enabled) test_clock_set(app, false);
+
+    if(app->view_port) view_port_free(app->view_port);
+    if(app->event_queue) furi_message_queue_free(app->event_queue);
+    if(app->capture_commands) furi_message_queue_free(app->capture_commands);
+    if(app->mutex) furi_mutex_free(app->mutex);
+    if(app->arm_display_sem) furi_semaphore_free(app->arm_display_sem);
     free(app->capture_buffer);
+    if(app->sump) sump_free(app->sump);
 
-    sump_free(app->sump);
-
-    usb_uart_disable(app->uart);
-
-    furi_record_close(RECORD_STORAGE);
-    furi_record_close(RECORD_DIALOGS);
-    furi_record_close(RECORD_GUI);
-    furi_record_close(RECORD_NOTIFICATION);
+    if(app->storage) furi_record_close(RECORD_STORAGE);
+    if(app->dialogs) furi_record_close(RECORD_DIALOGS);
+    if(app->gui) furi_record_close(RECORD_GUI);
+    if(app->notification) furi_record_close(RECORD_NOTIFICATION);
 }
 
 int32_t logic_analyzer_app_main(void* p) {
     UNUSED(p);
 
-    AppFSM* app = malloc(sizeof(AppFSM));
-    app_init(app);
+    AppFSM* app = calloc(1, sizeof(AppFSM));
+    if(!app) {
+        return -1;
+    }
+    if(!app_init(app)) {
+        app_deinit(app);
+        free(app);
+        return -1;
+    }
 
     dolphin_deed(DolphinDeedPluginGameStart);
     notification_message_block(app->notification, &sequence_display_backlight_enforce_on);
 
-    while(app->processing) {
-        app->processing = message_process(app);
+    bool processing = true;
+    while(processing) {
+        processing = message_process(app);
+        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+        app->processing = processing;
+        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
 
-        view_port_update(app->view_port);
+        furi_check(furi_mutex_acquire(app->mutex, FuriWaitForever) == FuriStatusOk);
+        bool redraw_idle = processing && !app->capture_active;
+        furi_check(furi_mutex_release(app->mutex) == FuriStatusOk);
+        if(redraw_idle) view_port_update(app->view_port);
     }
 
     notification_message_block(app->notification, &sequence_display_backlight_enforce_auto);

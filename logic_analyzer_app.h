@@ -1,38 +1,78 @@
 #ifndef __ARHA_FLIPPERAPP_DEMO
 #define __ARHA_FLIPPERAPP_DEMO
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 
-#include <furi.h>
-#include <gui/gui.h>
-#include <gui/elements.h>
 #include <dialogs/dialogs.h>
-#include <input/input.h>
-#include <storage/storage.h>
-#include <stdlib.h>
 #include <dolphin/dolphin.h>
+#include <furi.h>
+#include <gui/elements.h>
+#include <gui/gui.h>
+#include <input/input.h>
 #include <notification/notification.h>
 #include <notification/notification_messages.h>
+#include <stdlib.h>
+#include <storage/storage.h>
 
+#include "capture_state.h"
 #include "sump.h"
 #include "usb_uart.h"
 
 #define TAG "LogicAnalyzer"
 
-#define TIMER_HZ 50
-#define TIMEOUT 3
+#define TIMER_HZ   50
+#define TIMEOUT    3
 #define QUEUE_SIZE 32
 
-typedef enum { KeyNone, KeyUp, KeyRight, KeyDown, KeyLeft, KeyOK } KeyCode;
+typedef enum {
+    KeyNone,
+    KeyUp,
+    KeyRight,
+    KeyDown,
+    KeyLeft,
+    KeyOK
+} KeyCode;
 
-typedef enum { EventKeyPress, EventBufferFilled } EventType;
+typedef enum {
+    EventKeyPress,
+} EventType;
 
 typedef struct {
     EventType type;
     InputEvent input;
 } AppEvent;
+
+typedef struct {
+    size_t sample_count;
+    size_t posttrigger_count;
+    uint32_t divider;
+    uint8_t trigger_stage_count;
+    bool has_trigger;
+    uint8_t trigger_mask[SUMP_TRIGGER_STAGE_COUNT];
+    uint8_t trigger_values[SUMP_TRIGGER_STAGE_COUNT];
+} CaptureConfig;
+
+typedef enum {
+    CaptureCommandNone,
+    CaptureCommandStop,
+    CaptureCommandArm,
+    CaptureCommandFinish,
+    CaptureCommandAbort,
+} CaptureCommandType;
+
+typedef struct {
+    CaptureCommandType type;
+    uint32_t generation;
+    CaptureConfig config;
+} CaptureCommand;
+
+typedef enum {
+    InputPullFloat,
+    InputPullDown,
+    InputPullUp,
+} InputPullMode;
 
 typedef struct {
     FuriMessageQueue* event_queue;
@@ -45,15 +85,24 @@ typedef struct {
     Sump* sump;
 
     FuriMutex* mutex;
-    bool triggered;
+    FuriSemaphore* arm_display_sem;
+    FuriMessageQueue* capture_commands;
     bool processing;
+    bool capture_active;
+    bool test_clock_enabled;
+    InputPullMode input_pull;
 
     FuriThread* capture_thread;
     uint8_t* capture_buffer;
-    size_t capture_pos;
+    size_t capture_capacity;
+    size_t heap_free_before_capture;
+    size_t heap_max_block_before_capture;
+    uint32_t capture_generation;
+    CaptureConfig pending_capture;
+    size_t last_capture_count;
+    uint32_t last_capture_overruns;
     uint8_t current_levels;
 
-    char state_string[64];
 } AppFSM;
 
 #endif

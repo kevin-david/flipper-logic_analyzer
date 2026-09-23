@@ -7,6 +7,7 @@ App(
     entry_point="logic_analyzer_app_main",
     stack_size=2 * 1024,
     fap_category="GPIO",
+    sources=["*.c", "!tests"],
     # Optional values
     # fap_version="1.1",
     fap_icon="icons/app.png",  # 10x10 1-bit PNG

@@ -1,24 +1,33 @@
 
 #include <furi.h>
 
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "sump.h"
 
-void sump_handle_query(Sump* sump) {
-    sump->tx_data(sump->tx_data_ctx, (uint8_t*)"1ALS", 4);
+size_t sump_write_id(uint8_t* buffer, size_t buffer_size) {
+    if(!buffer || buffer_size < 4U) return 0;
+    memcpy(buffer, "1ALS", 4U);
+    return 4U;
 }
 
-void sump_handle_get_metadata(Sump* sump) {
-    uint8_t buf[128];
+size_t sump_write_metadata(const Sump* sump, uint8_t* buffer, size_t buffer_size) {
+    if(!sump || !buffer || buffer_size < SUMP_REPLY_BUFFER_SIZE) return 0;
+
+    uint8_t* buf = buffer;
     size_t pos = 0;
 
     const char* name = "Flipper LogicAnalyzer v1.0 (originally by g3gg0.de)";
     const char* fpga = "(none)";
     const char* firmware = "v0.99.1";
     const uint8_t probes = 8;
-    uint32_t max_sample_rate = 10000000;
-    uint32_t max_sample_mem = MAX_SAMPLE_MEM;
+    uint32_t max_sample_rate = SUMP_MAX_SAMPLE_RATE_HZ;
+    uint32_t max_sample_mem = sump->max_sample_count;
 
-    /* 0x01 	device name (e.g. "Openbench Logic Sniffer v1.0", "Bus Pirate v3b"  */
+    /* 0x01 	device name (e.g. "Openbench Logic Sniffer v1.0", "Bus Pirate
+   * v3b"  */
     buf[pos++] = 0x01;
     strcpy((char*)&buf[pos], name);
     pos += strlen(name) + 1;
@@ -58,15 +67,40 @@ void sump_handle_get_metadata(Sump* sump) {
     /* 0x00 	not used, key means end of metadata*/
     buf[pos++] = 0x00;
 
-    sump->tx_data(sump->tx_data_ctx, buf, pos);
+    return pos;
 }
 
-uint32_t get_word(uint8_t* data) {
-    return (data[3] << 24) | (data[2] << 16) | (data[1] << 8) | (data[0] << 0);
+static uint32_t get_word(const uint8_t* data) {
+    return ((uint32_t)data[3] << 24) | ((uint32_t)data[2] << 16) | ((uint32_t)data[1] << 8) |
+           (uint32_t)data[0];
 }
 
-size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
+static bool sump_handle_trigger_command(Sump* sump, uint8_t command, uint32_t extra) {
+    if(command < SUMP_CMD_TRIGGER_MASK || command > 0xCE) {
+        return false;
+    }
+
+    uint8_t offset = command - SUMP_CMD_TRIGGER_MASK;
+    uint8_t stage = offset / 4U;
+    uint8_t field = offset % 4U;
+    if(stage >= SUMP_TRIGGER_STAGE_COUNT || field > 2U) {
+        return false;
+    }
+
+    if(field == 0U) {
+        sump->trig_mask[stage] = extra;
+    } else if(field == 1U) {
+        sump->trig_values[stage] = extra;
+    } else {
+        sump->trig_config[stage] = extra;
+    }
+    return true;
+}
+
+SumpHandleResult sump_handle(Sump* sump, const uint8_t* data, size_t length) {
     size_t pos = 0;
+    SumpCaptureCommand capture_command = SumpCaptureCommandNone;
+    uint8_t replies = SumpReplyNone;
 
     while(pos < length) {
         uint8_t command = data[pos];
@@ -74,7 +108,11 @@ size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
 
         if(command & 0x80) {
             if(length - pos < 5) {
-                return pos;
+                return (SumpHandleResult){
+                    .consumed = pos,
+                    .capture_command = capture_command,
+                    .replies = replies,
+                };
             }
             pos++;
             extra = get_word(&data[pos]);
@@ -83,28 +121,35 @@ size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
             pos++;
         }
 
+        if(sump_handle_trigger_command(sump, command, extra)) {
+            continue;
+        }
+
         switch(command) {
         case SUMP_CMD_RESET:
-            sump->armed = false;
+            memset(sump->trig_mask, 0, sizeof(sump->trig_mask));
+            memset(sump->trig_values, 0, sizeof(sump->trig_values));
+            memset(sump->trig_config, 0, sizeof(sump->trig_config));
+            capture_command = SumpCaptureCommandAbort;
             break;
 
         case SUMP_CMD_ARM:
-            sump->armed = true;
+            capture_command = SumpCaptureCommandArm;
             break;
 
         case SUMP_CMD_QUERY_ID:
-            sump_handle_query(sump);
+            replies |= SumpReplyId;
             break;
 
         case SUMP_CMD_SELF_TEST:
             break;
 
         case SUMP_CMD_GET_METADATA:
-            sump_handle_get_metadata(sump);
+            replies |= SumpReplyMetadata;
             break;
 
         case SUMP_CMD_FINISH_NOW:
-            sump->armed = false;
+            capture_command = SumpCaptureCommandFinish;
             break;
 
         case SUMP_CMD_XON:
@@ -114,29 +159,22 @@ size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
             break;
 
         case SUMP_CMD_SET_READ_DELAY_COUNT:
-            sump->read_count = 4 * ((extra >> 16) + 1);
-            sump->delay_count = 4 * ((extra & 0xFFFF) + 1);
+            sump->read_count = 4 * ((extra & 0xFFFF) + 1);
+            if(sump->read_count > sump->max_sample_count) {
+                sump->read_count = sump->max_sample_count;
+            }
+            sump->delay_count = 4 * ((extra >> 16) + 1);
             break;
 
         case SUMP_CMD_SET_FLAGS:
-            sump->flags = (extra >> 24);
+            sump->flags = extra & 0xFF;
             break;
 
         case SUMP_CMD_SET_DIVIDER:
-            sump->divider = extra;
-            break;
-
-        case SUMP_CMD_TRIGGER_MASK:
-            sump->trig_mask = extra;
-            break;
-
-        case SUMP_CMD_TRIGGER_VALUES:
-            sump->trig_values = extra;
-            break;
-
-        case SUMP_CMD_TRIGGER_CONFIG:
-            sump->trig_delay = (extra >> 16);
-            sump->trig_config = (extra & 0xFFFF);
+            sump->divider = extra & 0xFFFFFF;
+            if(sump->divider < SUMP_MIN_DIVIDER) {
+                sump->divider = SUMP_MIN_DIVIDER;
+            }
             break;
 
         default:
@@ -144,11 +182,28 @@ size_t sump_handle(Sump* sump, uint8_t* data, size_t length) {
         }
     }
 
-    return pos;
+    return (SumpHandleResult){
+        .consumed = pos,
+        .capture_command = capture_command,
+        .replies = replies,
+    };
 }
 
-Sump* sump_alloc() {
-    Sump* sump = malloc(sizeof(Sump));
+Sump* sump_alloc(uint32_t max_sample_count) {
+    if(max_sample_count < 4U || max_sample_count > SUMP_MAX_SAMPLE_COUNT ||
+       (max_sample_count & 0x3U) != 0U) {
+        return NULL;
+    }
+
+    Sump* sump = calloc(1, sizeof(Sump));
+    if(!sump) {
+        return NULL;
+    }
+
+    sump->max_sample_count = max_sample_count;
+    sump->read_count = max_sample_count;
+    sump->delay_count = max_sample_count;
+    sump->divider = SUMP_MIN_DIVIDER;
 
     return sump;
 }
